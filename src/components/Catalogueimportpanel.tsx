@@ -42,7 +42,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { formatDinars } from "@/lib/format";
-import { logActivity } from "@/lib/activitylog";
+import { logActivity } from "@/lib/Activitylog";
 
 interface CatalogueImportPanelProps {
   /** Called when the user cancels the import (state is reset before this fires). */

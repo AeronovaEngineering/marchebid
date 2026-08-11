@@ -36,7 +36,7 @@ import { PageHeader } from "@/components/ui/pageHeader";
 import { EmptyState } from "@/components/ui/Emptystate";
 import { StatutBadge } from "@/components/StatutBadge";
 import { formatDinars, formatNumber } from "@/lib/format";
-import { logActivity } from "@/lib/activitylog";
+import { logActivity } from "@/lib/Activitylog";
 import { cn } from "@/lib/utils";
 
 /**

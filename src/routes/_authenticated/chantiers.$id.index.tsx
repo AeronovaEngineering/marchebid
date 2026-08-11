@@ -61,7 +61,7 @@ import {
 } from "@/components/ui/tooltip";
 import { formatDate, formatDinars } from "@/lib/format";
 import { parseBordereauServerFn } from "@/lib/parsing/parseBordereau";
-import { logActivity } from "@/lib/activitylog";
+import { logActivity } from "@/lib/Activitylog";
 
 // ----------------------------------------------------------------------------
 // Progression physique (Suivi tab). Requires migration:

@@ -47,7 +47,7 @@ import {
 } from "@/components/ui/sheet";
 import { CatalogueItemForm } from "@/components/CatalogueItemForm";
 import { CatalogueImportPanel } from "@/components/Catalogueimportpanel";
-import { logActivity } from "@/lib/activitylog";
+import { logActivity } from "@/lib/Activitylog";
 import { cn } from "@/lib/utils";
 import { formatDinars } from "@/lib/format";
 import { EmptyState } from "@/components/ui/Emptystate";
