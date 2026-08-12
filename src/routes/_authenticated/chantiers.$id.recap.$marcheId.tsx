@@ -3,6 +3,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createServerFn } from "@tanstack/react-start";
 import { ArrowLeft, FileDown, Lock, Loader2 } from "lucide-react";
+import { toast } from "sonner";
 
 import { supabase } from "@/integrations/supabase/client";
 import type { Tables } from "@/integrations/supabase/types";
@@ -18,13 +19,6 @@ import { cn } from "@/lib/utils";
 // ----------------------------------------------------------------------------
 // Server function
 // ----------------------------------------------------------------------------
-// Re-fetches the confirmed bid_lignes (+ marche_lignes + materiel_catalogue)
-// server-side with the service-role client -- never trusts the client-side
-// preview's computed totals for the actual PDF -- groups them into
-// roman-numeral chapters, hands that off to the dedicated PDF renderer in
-// src/lib/server/bordereauPdf.tsx, and persists the result as a NEW
-// `documents` row + `bordereaux/{marcheId}/v{n}.pdf` storage object. Prior
-// versions are never overwritten, so the Documents tab keeps every version.
 type GenerateBordereauResult = {
   url: string;
   version: number;
@@ -41,10 +35,6 @@ export const generateBordereauPdfServerFn = createServerFn({ method: "POST" })
   .handler(async ({ data }): Promise<GenerateBordereauResult> => {
     const marcheId = data.marcheId;
 
-    // Route files ship to the client bundle, so the service-role client
-    // and the PDF renderer (which pulls in @react-pdf/renderer, a
-    // server-only dependency) are both loaded dynamically here rather
-    // than imported at module scope.
     const [{ supabaseAdmin }, { generateBordereauPdfBuffer, toRoman }] = await Promise.all([
       import("@/integrations/supabase/client.server"),
       import("@/lib/server/bordereauPdf"),
@@ -92,41 +82,92 @@ export const generateBordereauPdfServerFn = createServerFn({ method: "POST" })
       .eq("id", "1")
       .maybeSingle();
 
-    // Group into chapters in the order they first appear (follows `ordre`),
-    // numbering them with roman numerals the same way the client's own
-    // bordereau template does (I, II, III...).
+    // Build lignes: description row (official wording, verbatim) +
+    // article sub-row (selected catalogue item + fourniture price) +
+    // pose sub-row (if applicable). The official designation is never
+    // overwritten by the chosen article's name — see bordereauPdf.tsx's
+    // LigneBlock for how the three row shapes render.
+    let itemCounter = 1;
+    const allLignes: { ligne: BordereauPdfLigne; chapitreKey: string }[] = [];
+
+    for (const row of confirmed) {
+      const quantite = Number(row.quantite ?? 0);
+      const prixFourniture = Number(row.bid.prix_fourniture ?? 0);
+      const prixPose = row.a_pose ? Number(row.bid.prix_pose ?? 0) : 0;
+      const articleDesignation = row.bid.materiel_catalogue?.designation ?? null;
+      const chapitreKey = row.chapitre_ou_zone?.trim() || "Sans chapitre";
+      const numero = String(itemCounter);
+
+      // Row 1: the official bordereau description, exactly as issued —
+      // no price on this row, that's broken out below.
+      allLignes.push({
+        ligne: {
+          numero,
+          designation: row.designation,
+          unite: row.unite,
+          quantite,
+          prixUnitaire: null,
+          prixTotal: null,
+        },
+        chapitreKey,
+      });
+
+      // Row 2: the selected catalogue article, with its fourniture price.
+      if (articleDesignation) {
+        allLignes.push({
+          ligne: {
+            numero: null,
+            designation: articleDesignation,
+            unite: null,
+            quantite: null,
+            prixUnitaire: prixFourniture,
+            prixTotal: quantite * prixFourniture,
+            isArticle: true,
+            parentNumero: numero,
+          },
+          chapitreKey,
+        });
+      }
+
+      // Row 3: pose, if applicable.
+      if (row.a_pose && prixPose > 0) {
+        allLignes.push({
+          ligne: {
+            numero: null,
+            designation: "Pose",
+            unite: null,
+            quantite: null,
+            prixUnitaire: prixPose,
+            prixTotal: quantite * prixPose,
+            isPose: true,
+            parentNumero: numero,
+          },
+          chapitreKey,
+        });
+      }
+
+      itemCounter++;
+    }
+
+    // Group into chapters
     const chapitreOrder: string[] = [];
-    const chapitreMap = new Map<string, typeof confirmed>();
-    for (const ligne of confirmed) {
-      const key = ligne.chapitre_ou_zone?.trim() || "Sans chapitre";
+    const chapitreMap = new Map<string, typeof allLignes>();
+    for (const item of allLignes) {
+      const key = item.chapitreKey;
       if (!chapitreMap.has(key)) {
         chapitreMap.set(key, []);
         chapitreOrder.push(key);
       }
-      chapitreMap.get(key)!.push(ligne);
+      chapitreMap.get(key)!.push(item);
     }
 
     const chapitres: BordereauPdfChapitre[] = chapitreOrder.map((nom, index) => {
-      const rows = chapitreMap.get(nom)!;
-      const pdfLignes: BordereauPdfLigne[] = rows.map((ligne) => {
-        const quantite = Number(ligne.quantite ?? 0);
-        const prixFourniture = Number(ligne.bid.prix_fourniture ?? 0);
-        const prixPose = ligne.a_pose ? Number(ligne.bid.prix_pose ?? 0) : 0;
-        const designation = ligne.bid.materiel_catalogue?.designation ?? ligne.designation;
-        return {
-          numero: ligne.numero,
-          designation,
-          unite: ligne.unite,
-          quantite,
-          prixFourniture,
-          totalFourniture: quantite * prixFourniture,
-          aPose: Boolean(ligne.a_pose),
-          prixPose,
-          totalPose: quantite * prixPose,
-        };
-      });
-      const sousTotal = pdfLignes.reduce((acc, l) => acc + l.totalFourniture + l.totalPose, 0);
-      return { numeroRomain: toRoman(index + 1), nom, lignes: pdfLignes, sousTotal };
+      const items = chapitreMap.get(nom)!;
+      const lignes = items.map((item) => item.ligne);
+      // Description rows carry a null prixTotal (their price lives on
+      // the article/pose sub-rows below), so guard against that here.
+      const sousTotal = lignes.reduce((acc, l) => acc + (l.prixTotal ?? 0), 0);
+      return { numeroRomain: toRoman(index + 1), nom, lignes, sousTotal };
     });
 
     const totalHt = chapitres.reduce((acc, c) => acc + c.sousTotal, 0);
@@ -135,11 +176,6 @@ export const generateBordereauPdfServerFn = createServerFn({ method: "POST" })
     const timbreFiscal = Number(company?.fiscal_stamp ?? 0);
     const totalTtc = totalHt + totalTva + timbreFiscal;
 
-    // Next sequential version for this marché. `documents` is read with
-    // `as never`, the same defensive cast chantiers.$id.index.tsx already
-    // uses, since its migration
-    // (202608120000000_add_documents_and_bordereaux_bucket.sql) may not
-    // be applied to every environment yet.
     const { data: existingDocs } = await supabaseAdmin
       .from("documents" as never)
       .select("version")
@@ -212,10 +248,6 @@ export const Route = createFileRoute(
   component: RecapMarchePage,
 });
 
-// A chantier has no literal "terminé" enum value in chantier_statut
-// (brouillon | en_cours | soumis | gagne | perdu) — "gagné" and "perdu" are
-// the two closed/final states, so we treat either as "terminé" for the
-// purposes of locking this page. Adjust here if a dedicated status is added.
 const CLOSED_STATUTS = new Set(["gagne", "perdu"]);
 
 type BidLigne = Tables<"bid_lignes">;
@@ -278,16 +310,59 @@ function RecapMarchePage() {
       map.get(key)!.push(ligne);
     }
     return Array.from(map.entries()).map(([chapitre, lignes]) => {
-      const rows = lignes.map((ligne) => {
+      let itemCounter = 1;
+      const rows = [];
+      for (const ligne of lignes) {
         const bid = ligne.bid_lignes!;
         const prixFourniture = Number(bid.prix_fourniture ?? 0);
         const prixPose = ligne.a_pose ? Number(bid.prix_pose ?? 0) : 0;
         const quantite = Number(ligne.quantite ?? 0);
-        const total = quantite * (prixFourniture + prixPose);
-        const designation = bid.materiel_catalogue?.designation ?? ligne.designation;
-        return { ligne, designation, prixFourniture, prixPose, quantite, total };
-      });
-      const sousTotal = rows.reduce((acc, r) => acc + r.total, 0);
+        const articleDesignation = bid.materiel_catalogue?.designation ?? null;
+        const numero = String(itemCounter);
+
+        // Row 1: the official bordereau description, unchanged — no
+        // price here, that's broken out on the sub-rows below it.
+        rows.push({
+          ligne,
+          kind: "description" as const,
+          designation: ligne.designation,
+          unite: ligne.unite,
+          quantite: quantite as number | null,
+          prixUnitaire: null as number | null,
+          total: null as number | null,
+          numero,
+        });
+
+        // Row 2: the selected catalogue article + its fourniture price.
+        if (articleDesignation) {
+          rows.push({
+            ligne,
+            kind: "article" as const,
+            designation: articleDesignation,
+            unite: null,
+            quantite: null,
+            prixUnitaire: prixFourniture,
+            total: quantite * prixFourniture,
+            numero: "",
+          });
+        }
+
+        // Row 3: pose, if applicable.
+        if (ligne.a_pose && prixPose > 0) {
+          rows.push({
+            ligne,
+            kind: "pose" as const,
+            designation: "Pose",
+            unite: null,
+            quantite: null,
+            prixUnitaire: prixPose,
+            total: quantite * prixPose,
+            numero: "",
+          });
+        }
+        itemCounter++;
+      }
+      const sousTotal = rows.reduce((acc, r) => acc + (r.total ?? 0), 0);
       return { chapitre, rows, sousTotal };
     });
   }, [confirmedLignes]);
@@ -296,10 +371,54 @@ function RecapMarchePage() {
 
   const isClosed = data?.chantier ? CLOSED_STATUTS.has(data.chantier.statut ?? "") : false;
 
+  // "Retour à l'édition" used to be a pure navigation — it never touched
+  // bid_lignes.statut, so every ligne stayed 'verifie' and the remplir
+  // screen's right pane (gated on allConfirmed) never left the "toutes
+  // confirmées" success card, no matter what you clicked there. This
+  // mutation reverts every confirmed ligne of this marché back to
+  // 'suggere' first, so remplir actually reopens the catalogue/candidates
+  // view to let the user pick something else — same effect a manual
+  // re-choice already has on any single ligne, just applied to all of
+  // them at once. Only used when the chantier isn't closed (locked
+  // chantiers don't allow re-editing at all — see isClosed below).
+  const reopenEditionMutation = useMutation({
+    mutationFn: async () => {
+      const ligneIds = (data?.lignes ?? []).map((l) => l.id);
+      if (ligneIds.length === 0) return;
+      const { error } = await supabase
+        .from("bid_lignes")
+        .update({ statut: "suggere", updated_at: new Date().toISOString() })
+        .eq("statut", "verifie")
+        .in("marche_ligne_id", ligneIds);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["marche-lignes", marcheId] });
+      navigate({
+        to: "/chantiers/$id/remplir/$marcheId",
+        params: { id: chantierId, marcheId },
+      });
+    },
+    onError: (error: Error) => {
+      toast.error("Impossible de rouvrir l'édition", { description: error.message });
+    },
+  });
+
+  function handleRetourEdition() {
+    if (isClosed) {
+      // Chantier locked: no statut change, just go look at it read-only.
+      navigate({
+        to: "/chantiers/$id/remplir/$marcheId",
+        params: { id: chantierId, marcheId },
+      });
+      return;
+    }
+    reopenEditionMutation.mutate();
+  }
+
   const generateMutation = useMutation({
     mutationFn: () => generateBordereauPdfServerFn({ data: { marcheId } }),
     onSuccess: async (result) => {
-      // Trigger the download.
       const link = document.createElement("a");
       link.href = result.url;
       link.download = result.fileName;
@@ -357,14 +476,14 @@ function RecapMarchePage() {
         action={
           <Button
             variant="outline"
-            onClick={() =>
-              navigate({
-                to: "/chantiers/$id/remplir/$marcheId",
-                params: { id: chantierId, marcheId },
-              })
-            }
+            disabled={reopenEditionMutation.isPending}
+            onClick={handleRetourEdition}
           >
-            <ArrowLeft className="mr-2 size-4" />
+            {reopenEditionMutation.isPending ? (
+              <Loader2 className="mr-2 size-4 animate-spin" />
+            ) : (
+              <ArrowLeft className="mr-2 size-4" />
+            )}
             Retour à l'édition
           </Button>
         }
@@ -373,7 +492,7 @@ function RecapMarchePage() {
       {isClosed && (
         <div className="mb-4 flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
           <Lock className="size-4 shrink-0" />
-          Ce chantier est clôturé ({chantier.statut === "gagne" ? "gagné" : "perdu"}). Le
+          Ce chantier est clôturé Le
           bordereau ne peut plus être régénéré depuis cette page.
         </div>
       )}
@@ -387,7 +506,6 @@ function RecapMarchePage() {
       ) : (
         <Card className="overflow-hidden">
           <CardContent className="p-8">
-            {/* Bordereau preview — styled to mirror the generated PDF layout */}
             <div className="mx-auto max-w-3xl space-y-8 font-serif text-[13px] leading-relaxed text-foreground">
               <header className="border-b border-border pb-4 text-center">
                 <p className="text-xs uppercase tracking-widest text-muted-foreground">
@@ -412,45 +530,53 @@ function RecapMarchePage() {
                   <table className="w-full border-collapse text-left">
                     <thead>
                       <tr className="text-xs uppercase tracking-wide text-muted-foreground">
-                        <th className="w-10 py-1.5 pr-2 font-medium">N°</th>
+                        <th className="w-12 py-1.5 pr-2 font-medium">N°</th>
                         <th className="py-1.5 pr-2 font-medium">Désignation</th>
+                        <th className="w-12 py-1.5 pr-2 font-medium">U</th>
                         <th className="w-16 py-1.5 pr-2 text-right font-medium">Qté</th>
-                        <th className="w-12 py-1.5 pr-2 font-medium">Unité</th>
-                        <th className="w-24 py-1.5 pr-2 text-right font-medium">
-                          P.U. fourniture
-                        </th>
-                        <th className="w-24 py-1.5 pr-2 text-right font-medium">P.U. pose</th>
-                        <th className="w-28 py-1.5 text-right font-medium">Total</th>
+                        <th className="w-24 py-1.5 pr-2 text-right font-medium">P.U. (H.T.V.A)</th>
+                        <th className="w-28 py-1.5 text-right font-medium">P.T. (H.T.V.A)</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {group.rows.map(({ ligne, designation, prixFourniture, prixPose, quantite, total }) => (
-                        <tr key={ligne.id} className="border-t border-border/60">
+                      {group.rows.map((row, idx) => (
+                        <tr
+                          key={idx}
+                          className={cn(
+                            "border-t border-border/60",
+                            row.kind === "pose" && "bg-muted/30",
+                          )}
+                        >
                           <td className="py-1.5 pr-2 align-top text-muted-foreground">
-                            {ligne.numero ?? "—"}
+                            {row.numero}
                           </td>
-                          <td className="py-1.5 pr-2 align-top">{designation}</td>
-                          <td className="py-1.5 pr-2 text-right align-top">
-                            {formatNumber(quantite)}
+                          <td
+                            className={cn(
+                              "py-1.5 pr-2 align-top",
+                              row.kind === "article" && "pl-4 font-medium",
+                              row.kind === "pose" && "pl-4 italic text-muted-foreground",
+                            )}
+                          >
+                            {row.kind === "article" ? `\u203A ${row.designation}` : row.designation}
                           </td>
                           <td className="py-1.5 pr-2 align-top text-muted-foreground">
-                            {ligne.unite ?? "—"}
+                            {row.unite ?? ""}
                           </td>
                           <td className="py-1.5 pr-2 text-right align-top">
-                            {formatDinars(prixFourniture)}
+                            {row.quantite !== null ? formatNumber(row.quantite) : ""}
                           </td>
                           <td className="py-1.5 pr-2 text-right align-top">
-                            {ligne.a_pose ? formatDinars(prixPose) : "—"}
+                            {row.prixUnitaire !== null ? formatDinars(row.prixUnitaire) : ""}
                           </td>
                           <td className="py-1.5 text-right align-top font-medium">
-                            {formatDinars(total)}
+                            {row.total !== null ? formatDinars(row.total) : ""}
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                   <div className="mt-1 flex justify-end border-t border-border pt-1 text-xs text-muted-foreground">
-                    Sous-total {group.chapitre} :&nbsp;
+                    S/TOTAL ({group.chapitre}) :&nbsp;
                     <span className="font-medium text-foreground">
                       {formatDinars(group.sousTotal)}
                     </span>
@@ -459,7 +585,7 @@ function RecapMarchePage() {
               ))}
 
               <div className="flex justify-end border-t-2 border-foreground/20 pt-3 text-base">
-                <span className="mr-3 font-medium">Total général HT</span>
+                <span className="mr-3 font-medium">TOTAL GÉNÉRAL (H.T.V.A)</span>
                 <span className="font-semibold">{formatDinars(grandTotal)}</span>
               </div>
             </div>
@@ -471,13 +597,8 @@ function RecapMarchePage() {
         <div className="mt-6 flex justify-end gap-3">
           <Button
             variant="outline"
-            disabled={generateMutation.isPending}
-            onClick={() =>
-              navigate({
-                to: "/chantiers/$id/remplir/$marcheId",
-                params: { id: chantierId, marcheId },
-              })
-            }
+            disabled={generateMutation.isPending || reopenEditionMutation.isPending}
+            onClick={handleRetourEdition}
           >
             Retour à l'édition
           </Button>

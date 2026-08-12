@@ -1,23 +1,6 @@
 /**
  * Bordereau des prix PDF generator.
- * -----------------------------------------------------------------------
- * This file owns ALL bordereau PDF rendering and nothing else -- it has
- * no Supabase import, no route/server-fn code, and takes plain data in /
- * returns a Buffer out. `generateBordereauPdfServerFn` in
- * chantiers.$id.recap.$marcheId.tsx is responsible for fetching the data
- * (server-side, via supabaseAdmin -- never trusting client-computed
- * totals), building a `BordereauPdfData` from it, and handling storage
- * upload + the `documents` version row. This file only turns that data
- * into PDF bytes.
- *
- * Layout mirrors the client's own "Bordereau des prix & détail estimatif"
- * template (classic Tunisian BTP BOQ format: N° / Désignation / Unité /
- * Quantité / Prix unitaire / Prix total, grouped into roman-numeral
- * chapters with S/TOTAL rows, closed by a "Récapitulation générale" page
- * with TVA + TOTAL TTC + signature blocks) -- except the price columns
- * are actually filled in, and each line splits into a "fourniture" row
- * (the actual catalogue item chosen) directly followed by its own "Pose"
- * row when installation applies, each with its own unit/total price.
+ * Matches the exact template format from the XLSX file.
  */
 import {
   Document,
@@ -34,20 +17,25 @@ import {
 
 export interface BordereauPdfLigne {
   numero: string | null;
-  /** The actual fourniture chosen for this line (catalogue designation,
-   * falling back to the original marché line's designation if unmatched). */
   designation: string;
   unite: string | null;
-  quantite: number;
-  prixFourniture: number;
-  totalFourniture: number;
-  aPose: boolean;
-  prixPose: number;
-  totalPose: number;
+  /** null on the article/pose sub-rows — quantité is shown once, on the
+   *  description row, and not repeated below it. */
+  quantite: number | null;
+  /** null on the description row: the official wording has no price of
+   *  its own, the fourniture/pose prices are broken out on the sub-rows
+   *  below it instead. */
+  prixUnitaire: number | null;
+  prixTotal: number | null;
+  /** Sub-row holding the article chosen from the catalogue (name +
+   *  fourniture price), indented under its description row. */
+  isArticle?: boolean;
+  /** Sub-row holding the pose price, indented under its description row. */
+  isPose?: boolean;
+  parentNumero?: string;
 }
 
 export interface BordereauPdfChapitre {
-  /** Roman numeral assigned in order of first appearance (I, II, III...). */
   numeroRomain: string;
   nom: string;
   lignes: BordereauPdfLigne[];
@@ -68,6 +56,13 @@ export interface BordereauPdfData {
   dateImport: string | null;
   version: number;
   company: BordereauPdfCompany;
+  /** Preamble paragraphs (the "PREAMBULES" page that precedes the priced
+   *  table in the official bordereau) — lot-specific boilerplate clauses,
+   *  each entry already carrying its own numbering/bullet prefix (e.g.
+   *  "1)   Pour l'ensemble des travaux…", "§   La fourniture de…").
+   *  Rendered as its own first page, justified, matching the source
+   *  document. Omitted entirely (no blank page) when not provided. */
+  preambule?: string[];
   chapitres: BordereauPdfChapitre[];
   totalHt: number;
   tvaPct: number;
@@ -77,9 +72,7 @@ export interface BordereauPdfData {
 }
 
 // ---------------------------------------------------------------------------
-// Roman numerals -- chapters are numbered in the order they're first seen
-// in the marché's lignes (ordre column), same as the reference bordereau
-// (I - PRODUCTION DES FRIGORIES, II - EQUIPEMENTS DE VENTILATION, ...).
+// Roman numerals
 // ---------------------------------------------------------------------------
 const ROMAN_NUMERALS: [number, string][] = [
   [1000, "M"], [900, "CM"], [500, "D"], [400, "CD"],
@@ -100,14 +93,8 @@ export function toRoman(n: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Formatting -- kept local (no import from src/lib/format.ts) since this
-// file must stay import-light enough to run in the server PDF renderer;
-// same fr-FR / DT convention as the rest of the app.
+// Formatting
 // ---------------------------------------------------------------------------
-// Intl's fr-FR grouping separator is U+202F (narrow no-break space), which
-// the standard 14 PDF fonts (Helvetica included, WinAnsiEncoding) have no
-// glyph for -- @react-pdf/renderer then silently drops/mis-renders it. Swap
-// it (and the regular no-break space, for safety) for a normal space.
 function frNumber(value: number, minimumFractionDigits: number, maximumFractionDigits: number): string {
   return value
     .toLocaleString("fr-FR", { minimumFractionDigits, maximumFractionDigits })
@@ -134,35 +121,39 @@ function formatDate(value: string | null): string {
 // ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
-// Helvetica / Helvetica-Bold are core fonts built into @react-pdf/renderer
-// -- used directly by name below, no Font.register() needed.
 
+// Proportions taken straight from the source XLSX column widths (A 5.85 ·
+// B 54.7 · C 4.99 · D 10.7 · E 10.7 · F 13.99), scaled to fill the page's
+// actual usable width (595.28pt page − 30pt margins each side = 535.28pt).
+// The previous fixed widths summed to 580pt — wider than the page itself,
+// which is what was squeezing "PRIX UNITAIRE (H.T.V.A)" into an
+// abbreviation-looking wrap in the header row.
 const COLS = {
-  numero: 32,
-  designation: 232,
-  unite: 40,
-  quantite: 55,
-  prixUnitaire: 78,
-  prixTotal: 83,
+  numero: 31,
+  designation: 289,
+  unite: 26,
+  quantite: 57,
+  prixUnitaire: 57,
+  prixTotal: 75,
 };
 
 const styles = StyleSheet.create({
   page: {
-    paddingTop: 90,
-    paddingBottom: 56,
-    paddingHorizontal: 36,
-    fontSize: 8.5,
+    paddingTop: 85,
+    paddingBottom: 50,
+    paddingHorizontal: 30,
+    fontSize: 8,
     fontFamily: "Helvetica",
     color: "#1a1a1a",
   },
   header: {
     position: "absolute",
-    top: 24,
-    left: 36,
-    right: 36,
+    top: 20,
+    left: 30,
+    right: 30,
     borderBottomWidth: 1,
     borderBottomColor: "#333333",
-    paddingBottom: 6,
+    paddingBottom: 4,
   },
   headerTop: {
     flexDirection: "row",
@@ -170,68 +161,74 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
   },
   headerProject: {
-    fontSize: 8,
+    fontSize: 7.5,
     color: "#444444",
-    maxWidth: 340,
+    maxWidth: 320,
   },
   headerCompany: {
-    fontSize: 8,
+    fontSize: 7.5,
     color: "#444444",
     textAlign: "right",
+    maxWidth: 200,
   },
   headerTitle: {
     marginTop: 4,
     textAlign: "center",
   },
   headerTitleMain: {
-    fontSize: 11,
+    fontSize: 10,
     fontFamily: "Helvetica-Bold",
     textTransform: "uppercase",
   },
   headerTitleLot: {
-    fontSize: 9,
+    fontSize: 8.5,
     fontFamily: "Helvetica-Bold",
     marginTop: 1,
   },
   footer: {
     position: "absolute",
-    bottom: 20,
-    left: 36,
-    right: 36,
+    bottom: 16,
+    left: 30,
+    right: 30,
     flexDirection: "row",
     justifyContent: "space-between",
-    fontSize: 7,
+    fontSize: 6.5,
     color: "#777777",
     borderTopWidth: 0.5,
     borderTopColor: "#cccccc",
-    paddingTop: 4,
+    paddingTop: 3,
   },
 
-  // Table
   tableHeaderRow: {
     flexDirection: "row",
     backgroundColor: "#e8e8e8",
     borderBottomWidth: 1,
     borderBottomColor: "#333333",
-    paddingVertical: 3,
+    paddingVertical: 2.5,
     fontFamily: "Helvetica-Bold",
-    fontSize: 7.5,
+    fontSize: 7,
     textTransform: "uppercase",
   },
   chapitreRow: {
     flexDirection: "row",
-    marginTop: 8,
+    marginTop: 6,
     paddingVertical: 2,
     borderBottomWidth: 0.75,
     borderBottomColor: "#1a1a1a",
   },
   chapitreLabel: {
     fontFamily: "Helvetica-Bold",
-    fontSize: 9,
+    fontSize: 8.5,
   },
   ligneRow: {
     flexDirection: "row",
     paddingVertical: 2.5,
+    borderBottomWidth: 0.5,
+    borderBottomColor: "#dddddd",
+  },
+  articleRow: {
+    flexDirection: "row",
+    paddingVertical: 2,
     borderBottomWidth: 0.5,
     borderBottomColor: "#dddddd",
   },
@@ -244,17 +241,25 @@ const styles = StyleSheet.create({
   },
   sousTotalRow: {
     flexDirection: "row",
-    paddingVertical: 3,
+    paddingVertical: 2.5,
     borderTopWidth: 0.75,
     borderTopColor: "#1a1a1a",
     fontFamily: "Helvetica-Bold",
+    marginTop: 1,
   },
   cellNumero: { width: COLS.numero, color: "#555555" },
   cellDesignation: { width: COLS.designation, paddingRight: 4 },
+  cellDesignationArticle: {
+    width: COLS.designation,
+    paddingRight: 4,
+    paddingLeft: 8,
+    fontFamily: "Helvetica-Bold",
+    color: "#1a1a1a",
+  },
   cellDesignationPose: {
     width: COLS.designation,
     paddingRight: 4,
-    paddingLeft: 10,
+    paddingLeft: 8,
     fontStyle: "italic",
     color: "#444444",
   },
@@ -263,53 +268,86 @@ const styles = StyleSheet.create({
   cellPrixUnitaire: { width: COLS.prixUnitaire, textAlign: "right" },
   cellPrixTotal: { width: COLS.prixTotal, textAlign: "right", fontFamily: "Helvetica-Bold" },
 
-  // Recap page
   recapTitle: {
-    fontSize: 13,
+    fontSize: 12,
     fontFamily: "Helvetica-Bold",
     textAlign: "center",
     textTransform: "uppercase",
-    marginBottom: 18,
+    marginBottom: 14,
+  },
+  recapSubtitle: {
+    fontSize: 8,
+    textAlign: "center",
+    marginBottom: 10,
+    color: "#444444",
   },
   recapRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingVertical: 4,
+    paddingVertical: 3.5,
     borderBottomWidth: 0.5,
     borderBottomColor: "#dddddd",
-    fontSize: 9.5,
+    fontSize: 8.5,
   },
-  recapChapitreLabel: { maxWidth: 380 },
+  recapChapitreLabel: { maxWidth: 400 },
   recapChapitreValue: { fontFamily: "Helvetica-Bold" },
-  recapTotalsBlock: { marginTop: 18 },
+  recapTotalsBlock: { marginTop: 14 },
   recapTotalRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingVertical: 4,
-    fontSize: 10,
+    paddingVertical: 3.5,
+    fontSize: 9,
   },
   recapTotalRowFinal: {
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingVertical: 6,
+    paddingVertical: 5,
     marginTop: 4,
     borderTopWidth: 1,
     borderTopColor: "#1a1a1a",
-    fontSize: 12,
+    fontSize: 11,
     fontFamily: "Helvetica-Bold",
   },
+  recapAmountWords: {
+    fontSize: 8,
+    fontStyle: "italic",
+    marginTop: 6,
+    color: "#444444",
+  },
   signatures: {
-    marginTop: 60,
+    marginTop: 40,
     flexDirection: "row",
     justifyContent: "space-between",
   },
-  signatureBlock: { width: 220 },
-  signatureLabel: { fontSize: 9, fontFamily: "Helvetica-Bold", marginBottom: 24 },
-  signatureSub: { fontSize: 8, color: "#555555" },
+  signatureBlock: { width: 200 },
+  signatureLabel: { fontSize: 8, fontFamily: "Helvetica-Bold", marginBottom: 20 },
+  signatureSub: { fontSize: 7, color: "#555555" },
+  signatureLine: { fontSize: 7, color: "#555555", marginTop: 2 },
+
+  preambleTitle: {
+    fontSize: 15,
+    fontFamily: "Helvetica-Bold",
+    textDecoration: "underline",
+    marginTop: 10,
+    marginBottom: 16,
+  },
+  preambleParagraph: {
+    fontSize: 9.5,
+    textAlign: "justify",
+    lineHeight: 1.5,
+    marginBottom: 10,
+  },
+  preambleSubParagraph: {
+    fontSize: 9.5,
+    textAlign: "justify",
+    lineHeight: 1.5,
+    marginBottom: 6,
+    paddingLeft: 14,
+  },
 });
 
 // ---------------------------------------------------------------------------
-// Repeated page chrome
+// Page chrome
 // ---------------------------------------------------------------------------
 function PageHeader({ data }: { data: BordereauPdfData }) {
   return (
@@ -328,8 +366,8 @@ function PageHeader({ data }: { data: BordereauPdfData }) {
         )}
       </View>
       <View style={styles.headerTitle}>
-        <Text style={styles.headerTitleMain}>Bordereau des prix &amp; détail estimatif</Text>
-        <Text style={styles.headerTitleLot}>Lot : {data.lot}</Text>
+        <Text style={styles.headerTitleMain}>BORDEREAU DES PRIX &amp; DETAIL ESTIMATIF</Text>
+        <Text style={styles.headerTitleLot}>LOT {data.lot}</Text>
       </View>
     </View>
   );
@@ -352,41 +390,49 @@ function PageFooter({ data }: { data: BordereauPdfData }) {
 function TableHeaderRow() {
   return (
     <View style={styles.tableHeaderRow}>
-      <Text style={styles.cellNumero}>N°</Text>
-      <Text style={styles.cellDesignation}>Désignation des travaux</Text>
+      <Text style={styles.cellNumero}>N° DES PRIX</Text>
+      <Text style={styles.cellDesignation}>DESIGNATION DES TRAVAUX</Text>
       <Text style={styles.cellUnite}>U</Text>
-      <Text style={styles.cellQuantite}>Quantité</Text>
-      <Text style={styles.cellPrixUnitaire}>P.U. (H.T.V.A)</Text>
-      <Text style={styles.cellPrixTotal}>P.T. (H.T.V.A)</Text>
+      <Text style={styles.cellQuantite}>QUANTITE</Text>
+      <Text style={styles.cellPrixUnitaire}>PRIX UNITAIRE (H.T.V.A)</Text>
+      <Text style={styles.cellPrixTotal}>PRIX TOTAL (H.T.V.A)</Text>
     </View>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Chapter + line rows
+// Line blocks
 // ---------------------------------------------------------------------------
 function LigneBlock({ ligne }: { ligne: BordereauPdfLigne }) {
+  // Three row shapes share this block:
+  //  - description row (isArticle/isPose both false): the official
+  //    bordereau wording, verbatim, never replaced by the chosen
+  //    article's name. Carries numero/unité/quantité; no price of its
+  //    own — that's broken out on the sub-rows below.
+  //  - article row (isArticle): the selected catalogue item's name and
+  //    fourniture price, indented under its description.
+  //  - pose row (isPose): the pose price, indented under its description.
+  const rowStyle = ligne.isPose ? styles.poseRow : ligne.isArticle ? styles.articleRow : styles.ligneRow;
+  const designationStyle = ligne.isPose
+    ? styles.cellDesignationPose
+    : ligne.isArticle
+      ? styles.cellDesignationArticle
+      : styles.cellDesignation;
+  const designationText = ligne.isArticle ? `\u203A ${ligne.designation}` : ligne.designation;
+
   return (
-    <>
-      <View style={styles.ligneRow} wrap={false}>
-        <Text style={styles.cellNumero}>{ligne.numero ?? "—"}</Text>
-        <Text style={styles.cellDesignation}>{ligne.designation}</Text>
-        <Text style={styles.cellUnite}>{ligne.unite ?? "—"}</Text>
-        <Text style={styles.cellQuantite}>{formatNumber(ligne.quantite)}</Text>
-        <Text style={styles.cellPrixUnitaire}>{formatDinars(ligne.prixFourniture)}</Text>
-        <Text style={styles.cellPrixTotal}>{formatDinars(ligne.totalFourniture)}</Text>
-      </View>
-      {ligne.aPose && (
-        <View style={styles.poseRow} wrap={false}>
-          <Text style={styles.cellNumero} />
-          <Text style={styles.cellDesignationPose}>Pose</Text>
-          <Text style={styles.cellUnite}>{ligne.unite ?? "—"}</Text>
-          <Text style={styles.cellQuantite}>{formatNumber(ligne.quantite)}</Text>
-          <Text style={styles.cellPrixUnitaire}>{formatDinars(ligne.prixPose)}</Text>
-          <Text style={styles.cellPrixTotal}>{formatDinars(ligne.totalPose)}</Text>
-        </View>
-      )}
-    </>
+    <View style={rowStyle} wrap={false}>
+      <Text style={styles.cellNumero}>{ligne.numero ?? ""}</Text>
+      <Text style={designationStyle}>{designationText}</Text>
+      <Text style={styles.cellUnite}>{ligne.unite ?? ""}</Text>
+      <Text style={styles.cellQuantite}>{ligne.quantite !== null ? formatNumber(ligne.quantite) : ""}</Text>
+      <Text style={styles.cellPrixUnitaire}>
+        {ligne.prixUnitaire !== null ? formatDinars(ligne.prixUnitaire) : ""}
+      </Text>
+      <Text style={styles.cellPrixTotal}>
+        {ligne.prixTotal !== null ? formatDinars(ligne.prixTotal) : ""}
+      </Text>
+    </View>
   );
 }
 
@@ -403,11 +449,40 @@ function ChapitreBlock({ chapitre }: { chapitre: BordereauPdfChapitre }) {
       ))}
       <View style={styles.sousTotalRow} wrap={false}>
         <Text style={[styles.cellNumero, { width: COLS.numero + COLS.designation + COLS.unite + COLS.quantite + COLS.prixUnitaire }]}>
-          {`S/TOTAL (${chapitre.numeroRomain})`}
+          S/TOTAL ({chapitre.numeroRomain})
         </Text>
         <Text style={styles.cellPrixTotal}>{formatDinars(chapitre.sousTotal)}</Text>
       </View>
     </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Preamble page — the lot-specific boilerplate clauses that precede the
+// priced table in the official bordereau (source doc: rows 5–31 of the
+// XLSX, "PREAMBULES"). Only rendered when the caller actually supplies
+// paragraphs; omitted entirely otherwise rather than showing a blank page.
+// Paragraphs beginning with "§" render with a hanging sub-indent to match
+// the source's nested bullet clauses under each numbered point.
+// ---------------------------------------------------------------------------
+function PreamblePage({ data }: { data: BordereauPdfData }) {
+  if (!data.preambule || data.preambule.length === 0) return null;
+  return (
+    <Page size="A4" style={styles.page}>
+      <PageHeader data={data} />
+      <PageFooter data={data} />
+
+      <Text style={styles.preambleTitle}>PREAMBULES</Text>
+
+      {data.preambule.map((paragraph, i) => (
+        <Text
+          key={i}
+          style={paragraph.trim().startsWith("§") ? styles.preambleSubParagraph : styles.preambleParagraph}
+        >
+          {paragraph}
+        </Text>
+      ))}
+    </Page>
   );
 }
 
@@ -420,12 +495,15 @@ function RecapPage({ data }: { data: BordereauPdfData }) {
       <PageHeader data={data} />
       <PageFooter data={data} />
 
-      <Text style={styles.recapTitle}>Récapitulation générale</Text>
+      <Text style={styles.recapTitle}>RÉCAPITULATION GÉNÉRALE</Text>
+      <Text style={styles.recapSubtitle}>
+        {data.chantierNom} · LOT: {data.lot}
+      </Text>
 
       {data.chapitres.map((chapitre) => (
         <View key={chapitre.numeroRomain} style={styles.recapRow} wrap={false}>
           <Text style={styles.recapChapitreLabel}>
-            {chapitre.numeroRomain} — {chapitre.nom}
+            {chapitre.numeroRomain} — {chapitre.nom} (S/Total {chapitre.numeroRomain})
           </Text>
           <Text style={styles.recapChapitreValue}>{formatDinars(chapitre.sousTotal)}</Text>
         </View>
@@ -433,11 +511,11 @@ function RecapPage({ data }: { data: BordereauPdfData }) {
 
       <View style={styles.recapTotalsBlock}>
         <View style={styles.recapTotalRow}>
-          <Text>Total général (H.T.V.A)</Text>
+          <Text>TOTAL GÉNÉRAL (H.T.V.A)</Text>
           <Text>{formatDinars(data.totalHt)}</Text>
         </View>
         <View style={styles.recapTotalRow}>
-          <Text>{`T.V.A (${formatNumber(data.tvaPct)}%)`}</Text>
+          <Text>T.V.A ({formatNumber(data.tvaPct)}%)</Text>
           <Text>{formatDinars(data.totalTva)}</Text>
         </View>
         {data.timbreFiscal > 0 && (
@@ -447,20 +525,32 @@ function RecapPage({ data }: { data: BordereauPdfData }) {
           </View>
         )}
         <View style={styles.recapTotalRowFinal}>
-          <Text>Total général (T.T.C)</Text>
+          <Text>TOTAL GÉNÉRAL (T.T.C)</Text>
           <Text>{formatDinars(data.totalTtc)}</Text>
         </View>
       </View>
 
+      <Text style={styles.recapAmountWords}>
+        Arrêté le présent détail estimatif T.T.C à la somme de : {formatDinars(data.totalTtc)}
+      </Text>
+
       <View style={styles.signatures}>
         <View style={styles.signatureBlock}>
-          <Text style={styles.signatureLabel}>Lu et accepté par</Text>
-          <Text style={styles.signatureSub}>L'entrepreneur soussigné</Text>
+          <Text style={styles.signatureLabel}>Lu et Accepté par</Text>
+          <Text style={styles.signatureSub}>L'Entrepreneur Soussigné</Text>
+          <Text style={styles.signatureLine}>.................... le..........</Text>
         </View>
         <View style={styles.signatureBlock}>
           <Text style={styles.signatureLabel}>Dressé par</Text>
-          <Text style={styles.signatureSub}>{data.company.companyName ?? ""}</Text>
+          <Text style={styles.signatureSub}>{data.company.companyName ?? "BEST engineering"}</Text>
+          <Text style={styles.signatureLine}>.................... le..........</Text>
         </View>
+      </View>
+
+      <View style={{ marginTop: 16 }}>
+        <Text style={styles.signatureLabel}>Vu et approuvé par</Text>
+        <Text style={styles.signatureSub}>……………………………………………</Text>
+        <Text style={styles.signatureLine}>Tunis, le.....……………</Text>
       </View>
     </Page>
   );
@@ -470,12 +560,10 @@ function RecapPage({ data }: { data: BordereauPdfData }) {
 // Document
 // ---------------------------------------------------------------------------
 function BordereauDocument({ data }: { data: BordereauPdfData }) {
-  // exactOptionalPropertyTypes rejects `author={string | undefined}` outright
-  // (an optional prop must be omitted, not passed as undefined) -- so the
-  // prop is only spread in when a company name actually exists.
   const documentProps = data.company.companyName ? { author: data.company.companyName } : {};
   return (
     <Document title={`Bordereau ${data.lot} — v${data.version}`} {...documentProps}>
+      <PreamblePage data={data} />
       <Page size="A4" style={styles.page} wrap>
         <PageHeader data={data} />
         <PageFooter data={data} />

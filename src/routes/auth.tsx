@@ -120,7 +120,7 @@ function AuthPage() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="prenom@bet.tn"
+              placeholder="email@exemple.com"
             />
           </div>
 

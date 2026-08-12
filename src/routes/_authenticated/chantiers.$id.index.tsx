@@ -80,6 +80,34 @@ const PROGRESSION_LABELS: Record<Progression, string> = {
 
 type MarcheStatut = "en_cours" | "termine";
 
+// Win/loss result of the marché, separate from MarcheStatut above (which
+// tracks bordereau-filling progress). One-way door once gagne/perdu is
+// set: enforced server-side by the marches_resultat_one_way_trg trigger
+// (see supabase/migrations/202608120000000_marches_resultat.sql) — the
+// Select below only mirrors that rule by hiding "En attente" once fixed,
+// it isn't the real guardrail.
+type MarcheResultat = "en_attente" | "gagne" | "perdu";
+
+const RESULTAT_LABELS: Record<MarcheResultat, string> = {
+  en_attente: "En attente",
+  gagne: "Gagné",
+  perdu: "Perdu",
+};
+
+// Chantier-level status — same value set StatutBadge already renders for
+// kind="chantier" (see RecapMarchePage's badge + CLOSED_STATUTS above).
+// "gagne" freezes every marché under this chantier from further edits (see
+// isLocked in the "Marchés" tab below), so changing it here has real
+// consequences elsewhere in the app, not just a label change.
+type ChantierStatut = "brouillon" | "en_cours" | "gagne" | "perdu";
+
+const CHANTIER_STATUT_LABELS: Record<ChantierStatut, string> = {
+  brouillon: "Brouillon",
+  en_cours: "En cours",
+  gagne: "Gagné",
+  perdu: "Perdu",
+};
+
 // A lot at or above this confirmed-lines percentage is treated as real,
 // in-progress work and can no longer be deleted from the UI.
 const DELETE_THRESHOLD_PCT = 60;
@@ -109,6 +137,7 @@ interface MarcheRow {
   format_detecte: string | null;
   date_import: string | null;
   statut?: MarcheStatut | null;
+  resultat?: MarcheResultat | null;
 }
 
 interface DocumentRow {
@@ -222,11 +251,20 @@ function ChantierDetailPage() {
   const [parseError, setParseError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Chantier statut update — optimistic like updateResultat below, reverted
+  // if the write fails (e.g. a one-way-door trigger on chantiers mirroring
+  // the one on marches_resultat, if one exists server-side).
+  const [updatingStatut, setUpdatingStatut] = useState(false);
+
   // Lot deletion. Only offered below the 60% confirmed-lines threshold —
   // this is meant for wiping out lots created purely for testing, not for
   // touching real in-progress work. See DELETE_THRESHOLD_PCT below.
   const [pendingDelete, setPendingDelete] = useState<{ id: string; lot: string; nbLignes: number } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Suivi tab: filters the confirmed-lines table by marché. Only surfaced
+  // in the UI when the chantier has more than one marché (see hasMultipleMarches).
+  const [suiviLotFilter, setSuiviLotFilter] = useState<string>("all");
 
   const stats = useMemo(() => {
     const rows = lignes ?? [];
@@ -252,6 +290,13 @@ function ChantierDetailPage() {
     () => (lignes ?? []).filter(isConfirmee),
     [lignes],
   );
+
+  const hasMultipleMarches = (marches?.length ?? 0) > 1;
+
+  const suiviLignesFiltered = useMemo(() => {
+    if (!hasMultipleMarches || suiviLotFilter === "all") return lignesConfirmeesSuivi;
+    return lignesConfirmeesSuivi.filter((row) => row.marche_id === suiviLotFilter);
+  }, [lignesConfirmeesSuivi, hasMultipleMarches, suiviLotFilter]);
 
   async function handleFileSelected(file: File) {
     if (!lotName.trim()) {
@@ -332,6 +377,66 @@ function ChantierDetailPage() {
     }
   }
 
+  async function updateChantierStatut(value: ChantierStatut) {
+    const previous = (chantier?.statut as ChantierStatut | null | undefined) ?? "brouillon";
+    if (value === previous) return;
+    setUpdatingStatut(true);
+    queryClient.setQueryData<typeof chantier>(["chantier", id], (prev) =>
+      prev ? { ...prev, statut: value } : prev,
+    );
+    const { error } = await supabase
+      .from("chantiers")
+      .update({ statut: value })
+      .eq("id", id);
+    if (error) {
+      toast.error("Impossible d'enregistrer le statut du chantier.");
+      queryClient.setQueryData<typeof chantier>(["chantier", id], (prev) =>
+        prev ? { ...prev, statut: previous } : prev,
+      );
+    } else {
+      void logActivity({
+        action: "update",
+        entity_type: "chantier",
+        entity_id: id,
+        details: { statut: value },
+      });
+      // "gagne" locks every marché below (see isLocked in the Marchés tab),
+      // so other queries derived from this chantier need a refresh too.
+      await queryClient.invalidateQueries({ queryKey: ["marches", id] });
+    }
+    setUpdatingStatut(false);
+  }
+
+  async function updateResultat(marcheId: string, value: MarcheResultat) {
+    const previous = marches?.find((m) => m.id === marcheId)?.resultat ?? "en_attente";
+    queryClient.setQueryData<MarcheRow[]>(["marches", id], (prev) =>
+      prev?.map((m) => (m.id === marcheId ? { ...m, resultat: value } : m)),
+    );
+    const { error } = await supabase
+      .from("marches")
+      // @ts-expect-error — `resultat` requires the pending migration; see note above.
+      .update({ resultat: value })
+      .eq("id", marcheId);
+    if (error) {
+      toast.error(
+        error.message.includes("en_attente")
+          ? "Ce marché est déjà gagné ou perdu : retour à \"En attente\" impossible."
+          : "Impossible d'enregistrer le résultat du marché.",
+      );
+      queryClient.setQueryData<MarcheRow[]>(["marches", id], (prev) =>
+        prev?.map((m) => (m.id === marcheId ? { ...m, resultat: previous } : m)),
+      );
+    } else {
+      void logActivity({
+        action: "update",
+        entity_type: "marche",
+        entity_id: marcheId,
+        details: { resultat: value },
+      });
+      await queryClient.invalidateQueries({ queryKey: ["chantier", id] });
+    }
+  }
+
   async function handleConfirmDelete() {
     const target = pendingDelete;
     if (!target) return;
@@ -401,6 +506,31 @@ function ChantierDetailPage() {
           </>
         }
         description={chantier.client ?? undefined}
+        action={
+          <Select
+            value={(chantier.statut as ChantierStatut | null) ?? "brouillon"}
+            disabled={updatingStatut}
+            onValueChange={(value) => updateChantierStatut(value as ChantierStatut)}
+          >
+            <SelectTrigger className="w-40">
+              {updatingStatut ? (
+                <span className="flex items-center gap-2 text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  <SelectValue />
+                </span>
+              ) : (
+                <SelectValue />
+              )}
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(CHANTIER_STATUT_LABELS) as ChantierStatut[]).map((key) => (
+                <SelectItem key={key} value={key}>
+                  {CHANTIER_STATUT_LABELS[key]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        }
       />
 
       {/* Stats row */}
@@ -515,6 +645,7 @@ function ChantierDetailPage() {
                     <TableHead>Date d'import</TableHead>
                     <TableHead>Lignes</TableHead>
                     <TableHead>% confirmées</TableHead>
+                    <TableHead>Résultat</TableHead>
                     <TableHead className="text-right">Action</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -558,6 +689,34 @@ function ChantierDetailPage() {
                         <TableCell>{formatDate(marche.date_import)}</TableCell>
                         <TableCell>{nbLignes}</TableCell>
                         <TableCell>{pct}%</TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
+                          <Select
+                            value={marche.resultat ?? "en_attente"}
+                            disabled={isLocked}
+                            onValueChange={(value) => updateResultat(marche.id, value as MarcheResultat)}
+                          >
+                            <SelectTrigger className="w-32">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {(Object.keys(RESULTAT_LABELS) as MarcheResultat[])
+                                // Once fixed (gagne/perdu), "En attente" is no longer
+                                // offered — the DB trigger is the real guardrail, this
+                                // just mirrors it in the UI.
+                                .filter(
+                                  (key) =>
+                                    key !== "en_attente" ||
+                                    !marche.resultat ||
+                                    marche.resultat === "en_attente",
+                                )
+                                .map((key) => (
+                                  <SelectItem key={key} value={key}>
+                                    {RESULTAT_LABELS[key]}
+                                  </SelectItem>
+                                ))}
+                            </SelectContent>
+                          </Select>
+                        </TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center justify-end gap-2">
                             {isComplete ? (
@@ -643,48 +802,70 @@ function ChantierDetailPage() {
         <TabsContent value="suivi" className="mt-4">
           {loadingLignes ? (
             <div className="flex justify-center py-10"><Loader2 className="size-5 animate-spin text-muted-foreground" /></div>
-          ) : lignesConfirmeesSuivi.length === 0 ? (
-            <EmptyState
-              icon={FileSpreadsheet}
-              title="Aucune ligne confirmée"
-              description="Le suivi de chantier apparaît ici une fois des lignes vérifiées dans le chiffrage."
-            />
           ) : (
-            <div className="overflow-hidden rounded-lg border border-border bg-card">
-              <Table>
-                <TableHeader>
-                  <TableRow className="bg-muted/50 text-xs uppercase tracking-wide text-muted-foreground">
-                    <TableHead>Désignation</TableHead>
-                    <TableHead>Zone / chapitre</TableHead>
-                    <TableHead>Progression</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {lignesConfirmeesSuivi.map((row) => (
-                    <TableRow key={row.id} className="border-t border-border">
-                      <TableCell className="font-medium">{row.designation}</TableCell>
-                      <TableCell>{row.chapitre_ou_zone ?? "—"}</TableCell>
-                      <TableCell>
-                        <Select
-                          value={row.progression ?? "non_commence"}
-                          onValueChange={(value) => updateProgression(row.id, value as Progression)}
-                        >
-                          <SelectTrigger className="w-44">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {(Object.keys(PROGRESSION_LABELS) as Progression[]).map((key) => (
-                              <SelectItem key={key} value={key}>
-                                {PROGRESSION_LABELS[key]}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+            <div className="space-y-3">
+              {hasMultipleMarches && (
+                <div className="flex justify-end">
+                  <Select value={suiviLotFilter} onValueChange={setSuiviLotFilter}>
+                    <SelectTrigger className="w-56">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">Tous les lots</SelectItem>
+                      {(marches ?? []).map((marche) => (
+                        <SelectItem key={marche.id} value={marche.id}>
+                          {marche.lot}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              {suiviLignesFiltered.length === 0 ? (
+                <EmptyState
+                  icon={FileSpreadsheet}
+                  title="Aucune ligne confirmée"
+                  description="Le suivi de chantier apparaît ici une fois des lignes vérifiées dans le chiffrage."
+                />
+              ) : (
+                <div className="overflow-hidden rounded-lg border border-border bg-card">
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="bg-muted/50 text-xs uppercase tracking-wide text-muted-foreground">
+                        <TableHead>Désignation</TableHead>
+                        <TableHead>Zone / chapitre</TableHead>
+                        <TableHead>Progression</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {suiviLignesFiltered.map((row) => (
+                        <TableRow key={row.id} className="border-t border-border">
+                          <TableCell className="font-medium">{row.designation}</TableCell>
+                          <TableCell>{row.chapitre_ou_zone ?? "—"}</TableCell>
+                          <TableCell>
+                            <Select
+                              value={row.progression ?? "non_commence"}
+                              onValueChange={(value) => updateProgression(row.id, value as Progression)}
+                            >
+                              <SelectTrigger className="w-44">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {(Object.keys(PROGRESSION_LABELS) as Progression[]).map((key) => (
+                                  <SelectItem key={key} value={key}>
+                                    {PROGRESSION_LABELS[key]}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
             </div>
           )}
         </TabsContent>

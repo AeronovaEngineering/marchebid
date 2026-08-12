@@ -47,11 +47,21 @@ import { Skeleton } from "@/components/ui/skeleton";
 // SCHEMA
 // ============================================================
 
+// Matches the chantiers.statut CHECK constraint added in
+// supabase/migrations/20260812090000_chantiers_statut_derivation.sql.
+//
+// Note: en_cours and perdu are normally *derived* by a DB trigger once a
+// chantier has marchés (see that migration), not hand-picked. They're kept
+// selectable here at creation time because a brand-new chantier has no
+// marchés yet, so the trigger is a no-op and won't silently overwrite
+// whatever's picked -- but picking them before any marché exists is a bit
+// of a fiction (there's nothing backing "en cours" or "perdu" yet). Flagging
+// this in case you'd rather restrict this form to just brouillon/propose.
 const chantierStatuses = [
   { value: "brouillon", label: "Brouillon" },
+  { value: "propose", label: "Proposé" },
   { value: "en_cours", label: "En cours" },
-  { value: "soumis", label: "Soumis" },
-  { value: "gagne", label: "Gagné" },
+  { value: "termine", label: "Terminé" },
   { value: "perdu", label: "Perdu" },
 ] as const;
 
@@ -59,7 +69,7 @@ const createChantierSchema = z.object({
   nom: z.string().min(1, "Le nom est requis"),
   client: z.string().optional(),
   lieu: z.string().optional(),
-  statut: z.enum(["brouillon", "en_cours", "soumis", "gagne", "perdu"]).default("brouillon"),
+  statut: z.enum(["brouillon", "propose", "en_cours", "termine", "perdu"]).default("brouillon"),
 });
 
 // z.input (not z.infer/z.output) here: `.default(...)` makes `statut`

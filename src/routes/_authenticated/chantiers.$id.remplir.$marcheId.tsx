@@ -5,7 +5,9 @@ import { createServerFn } from "@tanstack/react-start";
 import { toast } from "sonner";
 import {
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
+  Info,
   Loader2,
   Search,
   Sparkles,
@@ -32,6 +34,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { PageHeader } from "@/components/ui/pageHeader";
 import { EmptyState } from "@/components/ui/Emptystate";
 import { StatutBadge } from "@/components/StatutBadge";
@@ -793,13 +803,21 @@ function RightPane({
         </Card>
 
         {!selectedLigne ? (
-          <Card>
-            <EmptyState
-              icon={Wrench}
-              title="Sélectionnez une ligne"
-              description="Cliquez sur une ligne à gauche pour lui associer un article."
-            />
-          </Card>
+          <>
+            <Card>
+              <EmptyState
+                icon={Wrench}
+                title="Parcourez le catalogue"
+                description="Cliquez sur une ligne à gauche pour lui associer un article, ou parcourez le catalogue complet ci-dessous."
+              />
+            </Card>
+
+            {/* DEFAULT STATE: no ligne selected — general browsable catalogue.
+                No target ligne exists yet, so "Choisir" is disabled here;
+                this is a browse/inspect view (use the info icon for full
+                details) rather than an assignment flow. */}
+            <CatalogueSearchCard currentMaterielId={null} onChoose={onChoose} canChoose={false} />
+          </>
         ) : (
           <>
             <SelectedMaterielCard
@@ -816,18 +834,22 @@ function RightPane({
                 </CardContent>
               </Card>
             ) : (
-              candidates.length > 1 && (
-                <AlternativesCard
-                  candidates={candidates.slice(1)}
+              candidates.length > 0 && (
+                <RankedCandidatesCard
+                  candidates={candidates}
                   currentMaterielId={selectedLigne.bidLigne?.materiel_catalogue_id ?? null}
                   onChoose={onChoose}
                 />
               )
             )}
 
+            {/* SELECTED STATE: the general browsable catalogue stays
+                available below the ranked results for manual search /
+                override. */}
             <CatalogueSearchCard
               currentMaterielId={selectedLigne.bidLigne?.materiel_catalogue_id ?? null}
               onChoose={onChoose}
+              canChoose
             />
           </>
         )}
@@ -863,8 +885,11 @@ function SelectedMaterielCard({
         ) : (
           <div className="rounded-lg border border-border p-3">
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-sm font-medium">{materiel.designation}</p>
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <p className="truncate text-sm font-medium">{materiel.designation}</p>
+                  <MaterielInfoDialog materiel={materiel} />
+                </div>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   {materiel.fournisseurs?.nom ?? "Fournisseur inconnu"}
                 </p>
@@ -899,7 +924,14 @@ function SelectedMaterielCard({
   );
 }
 
-function AlternativesCard({
+// ---------------------------------------------------------------------------
+// Ranked candidates, produced by rankandSelect.ts's rankCandidates: unité +
+// catégorie hard-filtered first, then ordered by designation/specs
+// similarity, then by price as the final tiebreaker (see rankCandidates in
+// rankandSelect.ts) — candidates arrives here already in that order, so the
+// #1 (best) candidate is always candidates[0].
+// ---------------------------------------------------------------------------
+function RankedCandidatesCard({
   candidates,
   currentMaterielId,
   onChoose,
@@ -908,50 +940,225 @@ function AlternativesCard({
   currentMaterielId: string | null;
   onChoose: (materiel: Materiel) => void;
 }) {
+  const [top, ...rest] = candidates;
+  if (!top) return null;
+  const topMateriel = top.materiel;
+  const topIsCurrent = topMateriel.id === currentMaterielId;
+
   return (
     <Card>
       <CardContent className="py-4">
         <p className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Alternatives
+          Candidats classés
         </p>
-        <div className="space-y-2">
-          {candidates.map(({ materiel }) => (
-            <div
-              key={materiel.id}
-              className={cn(
-                "flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2",
-                materiel.id === currentMaterielId && "border-primary/40 bg-primary/5",
-              )}
-            >
-              <div className="min-w-0">
-                <p className="truncate text-sm">{materiel.designation}</p>
-                <p className="text-xs text-muted-foreground">
-                  {materiel.fournisseurs?.nom ?? "Fournisseur inconnu"} · {formatDinars(materiel.prix_fourniture)}
-                </p>
+
+        {/* #1 ranked candidate — shown prominently, this is what "Lancer
+            l'IA" prefills / what a manual click here selects immediately. */}
+        <div
+          className={cn(
+            "rounded-lg border-2 p-3",
+            topIsCurrent ? "border-primary/50 bg-primary/5" : "border-primary/30",
+          )}
+        >
+          <div className="mb-1.5 flex items-center gap-1.5">
+            <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary">
+              Meilleure correspondance
+            </span>
+          </div>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <p className="truncate text-sm font-medium">{topMateriel.designation}</p>
+                <MaterielInfoDialog materiel={topMateriel} />
               </div>
-              <Button size="sm" variant="outline" onClick={() => onChoose(materiel)}>
-                Choisir
-              </Button>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {topMateriel.fournisseurs?.nom ?? "Fournisseur inconnu"}
+              </p>
             </div>
-          ))}
+            <p className="whitespace-nowrap text-sm font-semibold tabular-nums">
+              {formatDinars(topMateriel.prix_fourniture)}
+            </p>
+          </div>
+          <Button
+            className="mt-3 w-full"
+            size="sm"
+            variant={topIsCurrent ? "outline" : "default"}
+            onClick={() => onChoose(topMateriel)}
+            disabled={topIsCurrent}
+          >
+            {topIsCurrent ? "Sélectionné" : "Choisir"}
+          </Button>
         </div>
+
+        {/* Remaining ranked candidates, in descending order. */}
+        {rest.length > 0 && (
+          <div className="mt-3 space-y-2">
+            {rest.map(({ materiel }) => (
+              <div
+                key={materiel.id}
+                className={cn(
+                  "flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2",
+                  materiel.id === currentMaterielId && "border-primary/40 bg-primary/5",
+                )}
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <p className="truncate text-sm">{materiel.designation}</p>
+                    <MaterielInfoDialog materiel={materiel} />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {materiel.fournisseurs?.nom ?? "Fournisseur inconnu"} · {formatDinars(materiel.prix_fourniture)}
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => onChoose(materiel)}
+                  disabled={materiel.id === currentMaterielId}
+                >
+                  {materiel.id === currentMaterielId ? "Sélectionné" : "Choisir"}
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Read-only info popup — full details for one catalogue item. Attached as a
+// small "i" icon on every catalogue item card/row, in both the default
+// browse pane and the ranked-candidates pane.
+// ---------------------------------------------------------------------------
+function MaterielInfoDialog({ materiel }: { materiel: Materiel }) {
+  // materiel_catalogue has no guaranteed image column in the shared
+  // Materiel type used across this file — read it defensively so this
+  // still compiles/renders whether or not the column exists, and simply
+  // omit the image if there isn't one.
+  const imageUrl = (materiel as unknown as { image_url?: string | null }).image_url ?? null;
+  const specs = (materiel.specs as Record<string, unknown> | null) ?? null;
+  const specEntries = specs ? Object.entries(specs) : [];
+
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <button
+          type="button"
+          onClick={(e) => e.stopPropagation()}
+          aria-label="Voir les détails de l'article"
+          className="shrink-0 rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <Info className="size-3.5" />
+        </button>
+      </DialogTrigger>
+      <DialogContent className="max-w-md" onClick={(e) => e.stopPropagation()}>
+        <DialogHeader>
+          <DialogTitle>{materiel.designation}</DialogTitle>
+          <DialogDescription>
+            {materiel.fournisseurs?.nom ?? "Fournisseur inconnu"}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          {imageUrl && (
+            <img
+              src={imageUrl}
+              alt={materiel.designation}
+              className="max-h-48 w-full rounded-md border border-border object-contain"
+            />
+          )}
+
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+            <InfoField label="Catégorie" value={materiel.categorie ?? "—"} />
+            <InfoField label="Sous-catégorie" value={materiel.sous_categorie ?? "—"} />
+            <InfoField label="Unité" value={materiel.unite ?? "—"} />
+            <InfoField label="Prix fourniture" value={formatDinars(materiel.prix_fourniture)} />
+            <InfoField
+              label="Statut"
+              value={materiel.statut === "verifie" ? "En stock" : "Brouillon"}
+            />
+          </div>
+
+          {specEntries.length > 0 && (
+            <div>
+              <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Spécifications
+              </p>
+              <div className="space-y-1 rounded-md border border-border p-2.5 text-sm">
+                {specEntries.map(([key, value]) => (
+                  <div key={key} className="flex items-start justify-between gap-3">
+                    <span className="text-muted-foreground">{key}</span>
+                    <span className="text-right font-medium">{String(value)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function InfoField({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="font-medium">{value}</p>
+    </div>
+  );
+}
+
+const CATALOGUE_PAGE_SIZE = 20;
+
 function CatalogueSearchCard({
   currentMaterielId,
   onChoose,
+  canChoose,
 }: {
   currentMaterielId: string | null;
   onChoose: (materiel: Materiel) => void;
+  /** When false (default/no-ligne-selected browse mode) there is no target
+   *  ligne to assign an article to — the "Choisir" buttons are shown
+   *  disabled instead of hidden, so the list still reads consistently
+   *  between the two states. */
+  canChoose: boolean;
 }) {
   const [search, setSearch] = useState("");
   const [categorie, setCategorie] = useState<string>("__all__");
+  const [sousCategorie, setSousCategorie] = useState<string>("__all__");
   const [fournisseurId, setFournisseurId] = useState<string>("__all__");
   const [enStockOnly, setEnStockOnly] = useState(false);
+  const [page, setPage] = useState(0);
 
+  // Any filter change invalidates the current page — otherwise you can land
+  // on e.g. page 3 of an empty filtered result set.
+  function resetPageAnd<T>(setter: (v: T) => void) {
+    return (v: T) => {
+      setPage(0);
+      setter(v);
+    };
+  }
+
+  // Total size of the real materiel_catalogue table, independent of the
+  // filters below — this is what backs the "142 articles disponibles"
+  // badge, so it always reflects the full catalogue, not the filtered view.
+  const catalogueCountQuery = useQuery({
+    queryKey: ["catalogue-total-count"],
+    queryFn: async () => {
+      const { count, error } = await supabase
+        .from("materiel_catalogue")
+        .select("*", { count: "exact", head: true });
+      if (error) throw error;
+      return count ?? 0;
+    },
+  });
+
+  // Filter option lists derived from the real catalogue data (not a
+  // hardcoded/stale list) — sous_categorie narrows to whatever's actually
+  // under the selected categorie, same as fournisseurs and categorie itself.
   const categoriesQuery = useQuery({
     queryKey: ["catalogue-categories"],
     queryFn: async () => {
@@ -964,6 +1171,17 @@ function CatalogueSearchCard({
     },
   });
 
+  const sousCategoriesQuery = useQuery({
+    queryKey: ["catalogue-sous-categories", categorie],
+    queryFn: async () => {
+      let query = supabase.from("materiel_catalogue").select("sous_categorie").not("sous_categorie", "is", null);
+      if (categorie !== "__all__") query = query.eq("categorie", categorie);
+      const { data, error } = await query;
+      if (error) throw error;
+      return Array.from(new Set((data ?? []).map((r) => r.sous_categorie).filter(Boolean))) as string[];
+    },
+  });
+
   const fournisseursQuery = useQuery({
     queryKey: ["fournisseurs-list"],
     queryFn: async () => {
@@ -973,33 +1191,51 @@ function CatalogueSearchCard({
     },
   });
 
+  // The actual browsable list — the full real materiel_catalogue table
+  // (no statut restriction: this is a browse/inspect view, drafts included,
+  // see the info popup's statut field), with real range()-based pagination
+  // instead of a silent .limit(20) truncation. `count: "exact"` on the same
+  // query gives the filtered total so pagination controls know how many
+  // pages actually exist.
   const resultsQuery = useQuery({
-    queryKey: ["catalogue-search", search, categorie, fournisseurId, enStockOnly],
+    queryKey: ["catalogue-search", search, categorie, sousCategorie, fournisseurId, enStockOnly, page],
     queryFn: async () => {
       let query = supabase
         .from("materiel_catalogue")
-        .select("*, fournisseurs:fournisseur_id(id, nom)")
-        .eq("statut", "verifie")
-        .limit(20);
+        .select("*, fournisseurs:fournisseur_id(id, nom)", { count: "exact" })
+        .order("designation", { ascending: true })
+        .range(page * CATALOGUE_PAGE_SIZE, page * CATALOGUE_PAGE_SIZE + CATALOGUE_PAGE_SIZE - 1);
 
       if (search.trim()) query = query.ilike("designation", `%${search.trim()}%`);
       if (categorie !== "__all__") query = query.eq("categorie", categorie);
+      if (sousCategorie !== "__all__") query = query.eq("sous_categorie", sousCategorie);
       if (fournisseurId !== "__all__") query = query.eq("fournisseur_id", fournisseurId);
       // Best-effort: no dedicated stock column, see file header note.
       if (enStockOnly) query = query.eq("specs->>en_stock", "true");
 
-      const { data, error } = await query;
+      const { data, error, count } = await query;
       if (error) throw error;
-      return (data ?? []) as unknown as Materiel[];
+      return { items: (data ?? []) as unknown as Materiel[], count: count ?? 0 };
     },
   });
+
+  const items = resultsQuery.data?.items ?? [];
+  const filteredCount = resultsQuery.data?.count ?? 0;
+  const totalPages = Math.max(1, Math.ceil(filteredCount / CATALOGUE_PAGE_SIZE));
 
   return (
     <Card>
       <CardContent className="py-4">
-        <p className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Catalogue complet
-        </p>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Catalogue complet
+          </p>
+          <span className="whitespace-nowrap rounded-full bg-muted px-2.5 py-1 text-xs font-semibold tabular-nums">
+            {catalogueCountQuery.isLoading
+              ? "…"
+              : `${formatNumber(catalogueCountQuery.data ?? 0)} articles disponibles`}
+          </span>
+        </div>
 
         <div className="space-y-2">
           <div className="relative">
@@ -1007,13 +1243,21 @@ function CatalogueSearchCard({
             <Input
               placeholder="Rechercher un article…"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => resetPageAnd(setSearch)(e.target.value)}
               className="pl-8"
             />
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <Select value={categorie} onValueChange={setCategorie}>
+            <Select
+              value={categorie}
+              onValueChange={(v) => {
+                // Changing categorie can invalidate the current
+                // sous_categorie selection, so reset it back to "all".
+                resetPageAnd(setCategorie)(v);
+                setSousCategorie("__all__");
+              }}
+            >
               <SelectTrigger className="h-8 w-auto min-w-[9rem] text-xs">
                 <SelectValue placeholder="Catégorie" />
               </SelectTrigger>
@@ -1027,7 +1271,21 @@ function CatalogueSearchCard({
               </SelectContent>
             </Select>
 
-            <Select value={fournisseurId} onValueChange={setFournisseurId}>
+            <Select value={sousCategorie} onValueChange={resetPageAnd(setSousCategorie)}>
+              <SelectTrigger className="h-8 w-auto min-w-[9rem] text-xs">
+                <SelectValue placeholder="Sous-catégorie" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all__">Toutes sous-catégories</SelectItem>
+                {(sousCategoriesQuery.data ?? []).map((sousCat) => (
+                  <SelectItem key={sousCat} value={sousCat}>
+                    {sousCat}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <Select value={fournisseurId} onValueChange={resetPageAnd(setFournisseurId)}>
               <SelectTrigger className="h-8 w-auto min-w-[9rem] text-xs">
                 <SelectValue placeholder="Fournisseur" />
               </SelectTrigger>
@@ -1042,7 +1300,10 @@ function CatalogueSearchCard({
             </Select>
 
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Checkbox checked={enStockOnly} onCheckedChange={(v) => setEnStockOnly(v === true)} />
+              <Checkbox
+                checked={enStockOnly}
+                onCheckedChange={(v) => resetPageAnd(setEnStockOnly)(v === true)}
+              />
               En stock uniquement
             </label>
           </div>
@@ -1065,10 +1326,10 @@ function CatalogueSearchCard({
                 Réessayer
               </Button>
             </div>
-          ) : (resultsQuery.data ?? []).length === 0 ? (
+          ) : items.length === 0 ? (
             <p className="py-6 text-center text-sm text-muted-foreground">Aucun résultat.</p>
           ) : (
-            (resultsQuery.data ?? []).map((materiel) => (
+            items.map((materiel) => (
               <div
                 key={materiel.id}
                 className={cn(
@@ -1077,18 +1338,60 @@ function CatalogueSearchCard({
                 )}
               >
                 <div className="min-w-0">
-                  <p className="truncate text-sm">{materiel.designation}</p>
+                  <div className="flex items-center gap-1.5">
+                    <p className="truncate text-sm">{materiel.designation}</p>
+                    <MaterielInfoDialog materiel={materiel} />
+                  </div>
                   <p className="text-xs text-muted-foreground">
                     {materiel.fournisseurs?.nom ?? "Fournisseur inconnu"} · {formatDinars(materiel.prix_fourniture)}
                   </p>
                 </div>
-                <Button size="sm" variant="outline" onClick={() => onChoose(materiel)}>
-                  Choisir
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => onChoose(materiel)}
+                  disabled={!canChoose || materiel.id === currentMaterielId}
+                  title={canChoose ? undefined : "Sélectionnez une ligne à gauche d'abord"}
+                >
+                  {materiel.id === currentMaterielId ? "Sélectionné" : "Choisir"}
                 </Button>
               </div>
             ))
           )}
         </div>
+
+        {/* Real pagination controls — the browse list is never silently
+            truncated; instead it pages through the full filtered result set. */}
+        {!resultsQuery.isLoading && !resultsQuery.isError && filteredCount > 0 && (
+          <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
+            <p className="text-xs text-muted-foreground">
+              {formatNumber(filteredCount)} résultat{filteredCount > 1 ? "s" : ""}
+            </p>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2"
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+              >
+                <ChevronLeft className="size-3.5" />
+              </Button>
+              <span className="text-xs tabular-nums text-muted-foreground">
+                Page {page + 1} / {totalPages}
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2"
+                onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                disabled={page >= totalPages - 1}
+              >
+                <ChevronRight className="size-3.5" />
+              </Button>
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
   );
