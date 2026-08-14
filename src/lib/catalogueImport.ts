@@ -14,6 +14,8 @@ export type ImportedItem = {
   unite: string;
   prix_fourniture: number;
   specs: Record<string, any>;
+  /** Derived from an explicit stock column in the import file, if present. */
+  statut: "brouillon" | "verifie";
 };
 
 export const createFournisseurSchema = z.object({
@@ -63,30 +65,114 @@ export function findKey(obj: any, possibleKeys: string[]): string | null {
   return null;
 }
 
+/**
+ * Interprets common truthy/falsy spellings found in spreadsheet stock
+ * columns: real booleans, 1/0, and French/English yes-no words.
+ */
+function parseBooleanish(value: any): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const s = String(value ?? "").trim().toLowerCase();
+  return ["true", "1", "oui", "yes", "y", "vrai", "x", "disponible"].includes(s);
+}
+
+/**
+ * Parses a designation/description cell that may hold a plain string OR a
+ * JSON blob of structured specs (e.g. '{"diametre":"16mm","pression":"10bar"}').
+ * Not every import file uses the JSON format, so this degrades gracefully:
+ * - Valid JSON object -> its keys become `specs`. If no separate designation
+ *   was found elsewhere on the row, a name-like key inside the JSON (if any)
+ *   is used as the designation.
+ * - Anything else (plain text, or JSON that fails to parse) -> treated as
+ *   plain text, only used as a designation fallback, specs stays empty.
+ */
+function parseDescriptionField(
+  raw: any,
+  hasSeparateDesignation: boolean
+): { designationFallback: string; specs: Record<string, any> } {
+  if (typeof raw === "string" && raw.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const nameKeyInJson = findKey(parsed, ["designation", "nom", "name", "libelle", "title"]);
+        const specs: Record<string, any> = {};
+        let designationFallback = "";
+        for (const [k, v] of Object.entries(parsed)) {
+          if (k === nameKeyInJson && !hasSeparateDesignation) {
+            designationFallback = String(v ?? "").trim();
+            continue; // don't duplicate it inside specs
+          }
+          specs[k] = v;
+        }
+        return { designationFallback, specs };
+      }
+    } catch {
+      // Not actually valid JSON despite the leading "{" - fall through
+      // to the plain-text branch below.
+    }
+  }
+
+  // Plain text (or invalid JSON): only useful as a designation fallback.
+  const text = raw == null ? "" : String(raw).trim();
+  return {
+    designationFallback: hasSeparateDesignation ? "" : text,
+    specs: {},
+  };
+}
+
 function mapRow(row: any): ImportedItem {
   const getVal = (key: string | null): any => (key ? row[key] : undefined);
 
-  const designationKey = findKey(row, ["designation", "nom", "name", "article", "produit", "description"]);
+  const designationKey = findKey(row, ["designation", "nom", "name", "article", "produit", "libelle"]);
   const categorieKey = findKey(row, ["categorie", "category", "catégorie", "type"]);
   const sousCategorieKey = findKey(row, ["sous_categorie", "subcategory", "sous-catégorie", "sous categorie"]);
   const uniteKey = findKey(row, ["unite", "unit", "unité", "u"]);
   const prixKey = findKey(row, ["prix_fourniture", "prix", "price", "prix_ht", "ht"]);
+  const descriptionKey = findKey(row, ["description", "desc", "details"]);
+  const stockKey = findKey(row, ["en_stock", "instock", "in_stock", "stock", "disponible"]);
 
-  const specs: any = {};
-  const skipKeys = ["designation", "categorie", "sous_categorie", "unite", "prix_fourniture", "prix", "price"];
+  const rawDesignation = getVal(designationKey);
+  let designation = rawDesignation ? String(rawDesignation).trim() : "";
+
+  const { designationFallback, specs } = parseDescriptionField(
+    getVal(descriptionKey),
+    Boolean(designation)
+  );
+  if (!designation && designationFallback) {
+    designation = designationFallback;
+  }
+
+  // Any remaining columns not already accounted for (designation, category,
+  // sub-category, unit, price, description, stock) still fall through to
+  // specs, same as before - this keeps files with a flat "extra columns are
+  // specs" shape (no JSON description) working exactly as they did.
+  const mappedKeys = new Set(
+    [designationKey, categorieKey, sousCategorieKey, uniteKey, prixKey, descriptionKey, stockKey].filter(
+      (k): k is string => Boolean(k)
+    )
+  );
   Object.keys(row || {}).forEach((key) => {
-    if (!skipKeys.some((s) => key.toLowerCase().includes(s))) {
+    if (!mappedKeys.has(key)) {
       specs[key] = row[key];
     }
   });
 
+  const stockRaw = getVal(stockKey);
+  const hasStockValue = Boolean(stockKey) && stockRaw !== undefined && stockRaw !== null && stockRaw !== "";
+  const statut: ImportedItem["statut"] = hasStockValue
+    ? parseBooleanish(stockRaw)
+      ? "verifie"
+      : "brouillon"
+    : "brouillon";
+
   return {
-    designation: getVal(designationKey) || "",
+    designation,
     categorie: getVal(categorieKey) || "",
     sous_categorie: getVal(sousCategorieKey) || "",
     unite: getVal(uniteKey) || "u",
     prix_fourniture: parseFloat(getVal(prixKey)) || 0,
     specs,
+    statut,
   };
 }
 
@@ -162,7 +248,7 @@ export async function insertCatalogueImport(fournisseurId: string, items: Import
     unite: item.unite || "u",
     prix_fourniture: item.prix_fourniture || 0,
     specs: item.specs || {},
-    statut: "brouillon" as const,
+    statut: item.statut,
   }));
 
   const { data: inserted, error } = await supabase

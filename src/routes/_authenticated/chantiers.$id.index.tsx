@@ -122,10 +122,12 @@ interface MarcheLigneRow {
   id: string;
   marche_id: string;
   quantite: number | null;
+  unite: string | null;
   a_pose: boolean | null;
   designation: string;
   chapitre_ou_zone: string | null;
   progression?: Progression | null;
+  quantite_realisee?: number | null;
   bid_lignes: BidLigneInfo | BidLigneInfo[] | null;
 }
 
@@ -286,6 +288,19 @@ function ChantierDetailPage() {
     });
   }, [marches, lignes]);
 
+  // Per-marché physical progress: sum of quantite_realisee vs sum of quantite
+  // across ALL lines of the marché (not just confirmed ones — a line can be
+  // on site even before it's been confirmed in the pricing step).
+  const suiviMarchesProgress = useMemo(() => {
+    return (marches ?? []).map((marche) => {
+      const rows = (lignes ?? []).filter((l) => l.marche_id === marche.id);
+      const totalQty = rows.reduce((sum, r) => sum + Number(r.quantite ?? 0), 0);
+      const totalRealisee = rows.reduce((sum, r) => sum + Number(r.quantite_realisee ?? 0), 0);
+      const pctPhysique = totalQty > 0 ? Math.min(100, Math.round((totalRealisee / totalQty) * 100)) : 0;
+      return { marcheId: marche.id, lot: marche.lot, totalQty, totalRealisee, pctPhysique };
+    });
+  }, [marches, lignes]);
+
   const lignesConfirmeesSuivi = useMemo(
     () => (lignes ?? []).filter(isConfirmee),
     [lignes],
@@ -373,6 +388,33 @@ function ChantierDetailPage() {
       toast.error(
         "Impossible d'enregistrer la progression : la colonne 'progression' n'existe pas encore (migration requise).",
       );
+      queryClient.invalidateQueries({ queryKey: ["marche_lignes", "chantier", id] });
+    }
+  }
+
+  async function updateQuantiteRealisee(ligneId: string, value: number, currentQuantite: number | null) {
+    // Optimistic update
+    queryClient.setQueryData<MarcheLigneRow[]>(["marche_lignes", "chantier", id], (prev) =>
+      prev?.map((row) => (row.id === ligneId ? { ...row, quantite_realisee: value } : row)),
+    );
+
+    // Auto-promote to termine when quantite_realisee reaches quantite
+    const updates: Record<string, unknown> = { quantite_realisee: value };
+    if (currentQuantite !== null && value >= currentQuantite && value > 0) {
+      updates.progression = "termine";
+      queryClient.setQueryData<MarcheLigneRow[]>(["marche_lignes", "chantier", id], (prev) =>
+        prev?.map((row) => (row.id === ligneId ? { ...row, progression: "termine" } : row)),
+      );
+    }
+
+    const { error } = await supabase
+      .from("marche_lignes")
+      // @ts-expect-error — quantite_realisee requires the pending migration
+      .update(updates)
+      .eq("id", ligneId);
+
+    if (error) {
+      toast.error("Impossible d'enregistrer la quantité réalisée.");
       queryClient.invalidateQueries({ queryKey: ["marche_lignes", "chantier", id] });
     }
   }
@@ -803,7 +845,7 @@ function ChantierDetailPage() {
           {loadingLignes ? (
             <div className="flex justify-center py-10"><Loader2 className="size-5 animate-spin text-muted-foreground" /></div>
           ) : (
-            <div className="space-y-3">
+            <div className="space-y-4">
               {hasMultipleMarches && (
                 <div className="flex justify-end">
                   <Select value={suiviLotFilter} onValueChange={setSuiviLotFilter}>
@@ -822,6 +864,34 @@ function ChantierDetailPage() {
                 </div>
               )}
 
+              {/* Per-lot physical progress bars */}
+              {suiviMarchesProgress
+                .filter((mp) => suiviLotFilter === "all" || mp.marcheId === suiviLotFilter)
+                .map((mp) => (
+                  <div key={mp.marcheId} className="rounded-lg border border-border bg-card p-4">
+                    <div className="mb-2 flex items-center justify-between text-sm">
+                      <span className="font-medium">{mp.lot}</span>
+                      <span className="tabular-nums text-muted-foreground">
+                        {mp.totalRealisee % 1 === 0 ? mp.totalRealisee : mp.totalRealisee.toFixed(2)}
+                        {" / "}
+                        {mp.totalQty % 1 === 0 ? mp.totalQty : mp.totalQty.toFixed(2)}
+                        {" — "}
+                        <span className={mp.pctPhysique === 100 ? "font-semibold text-success" : "text-foreground"}>
+                          {mp.pctPhysique}%
+                        </span>
+                      </span>
+                    </div>
+                    <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          mp.pctPhysique === 100 ? "bg-success" : "bg-primary"
+                        }`}
+                        style={{ width: `${mp.pctPhysique}%` }}
+                      />
+                    </div>
+                  </div>
+                ))}
+
               {suiviLignesFiltered.length === 0 ? (
                 <EmptyState
                   icon={FileSpreadsheet}
@@ -835,33 +905,79 @@ function ChantierDetailPage() {
                       <TableRow className="bg-muted/50 text-xs uppercase tracking-wide text-muted-foreground">
                         <TableHead>Désignation</TableHead>
                         <TableHead>Zone / chapitre</TableHead>
+                        <TableHead>Quantité réalisée</TableHead>
                         <TableHead>Progression</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {suiviLignesFiltered.map((row) => (
-                        <TableRow key={row.id} className="border-t border-border">
-                          <TableCell className="font-medium">{row.designation}</TableCell>
-                          <TableCell>{row.chapitre_ou_zone ?? "—"}</TableCell>
-                          <TableCell>
-                            <Select
-                              value={row.progression ?? "non_commence"}
-                              onValueChange={(value) => updateProgression(row.id, value as Progression)}
-                            >
-                              <SelectTrigger className="w-44">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {(Object.keys(PROGRESSION_LABELS) as Progression[]).map((key) => (
-                                  <SelectItem key={key} value={key}>
-                                    {PROGRESSION_LABELS[key]}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </TableCell>
-                        </TableRow>
-                      ))}
+                      {suiviLignesFiltered.map((row) => {
+                        const isTermine = (row.progression ?? "non_commence") === "termine";
+                        const qte = Number(row.quantite ?? 0);
+                        const realisee = Number(row.quantite_realisee ?? 0);
+                        return (
+                          <TableRow key={row.id} className="border-t border-border">
+                            <TableCell className="font-medium">{row.designation}</TableCell>
+                            <TableCell className="text-muted-foreground">{row.chapitre_ou_zone ?? "—"}</TableCell>
+                            <TableCell>
+                              {isTermine ? (
+                                // Terminé: show final qty, no input needed
+                                <span className="tabular-nums text-sm text-muted-foreground">
+                                  {realisee % 1 === 0 ? realisee : realisee.toFixed(2)}
+                                  {" / "}
+                                  {qte % 1 === 0 ? qte : qte.toFixed(2)}
+                                  {row.unite ? ` ${row.unite}` : ""}
+                                </span>
+                              ) : (
+                                // Not yet done: inline editable input
+                                <div className="flex items-center gap-1.5">
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    step="any"
+                                    defaultValue={realisee}
+                                    className="h-8 w-24 rounded-md border border-input bg-background px-2 text-right text-sm tabular-nums focus:outline-none focus:ring-1 focus:ring-ring"
+                                    onBlur={(e) => {
+                                      const val = parseFloat(e.target.value);
+                                      if (!isNaN(val) && val !== realisee) {
+                                        updateQuantiteRealisee(row.id, val, qte || null);
+                                      }
+                                    }}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                                    }}
+                                  />
+                                  <span className="text-sm text-muted-foreground">
+                                    / {qte % 1 === 0 ? qte : qte.toFixed(2)}{row.unite ? ` ${row.unite}` : ""}
+                                  </span>
+                                </div>
+                              )}
+                            </TableCell>
+                            <TableCell>
+                              {isTermine ? (
+                                <span className="inline-flex items-center rounded-full bg-success/15 px-2 py-0.5 text-[11px] font-medium text-success">
+                                  Terminé
+                                </span>
+                              ) : (
+                                <Select
+                                  value={row.progression ?? "non_commence"}
+                                  onValueChange={(value) => updateProgression(row.id, value as Progression)}
+                                >
+                                  <SelectTrigger className="w-40">
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {(Object.keys(PROGRESSION_LABELS) as Progression[]).map((key) => (
+                                      <SelectItem key={key} value={key}>
+                                        {PROGRESSION_LABELS[key]}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </div>

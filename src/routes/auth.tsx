@@ -72,7 +72,7 @@ function AuthPage() {
           <div className="flex size-9 items-center justify-center rounded-md bg-sidebar-primary text-sidebar-primary-foreground">
             <HardHat className="size-5" />
           </div>
-          <span className="text-sm font-semibold text-sidebar-accent-foreground">Métré BTP</span>
+          <span className="text-sm font-semibold text-sidebar-accent-foreground">AeroNova Engineering</span>
         </div>
         <div className="max-w-md">
           <h1 className="text-3xl font-semibold leading-tight text-sidebar-accent-foreground">

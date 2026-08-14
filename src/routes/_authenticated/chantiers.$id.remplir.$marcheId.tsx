@@ -126,14 +126,29 @@ const EMPTY_BID_LIGNE: Omit<BidLigne, "id" | "marche_ligne_id"> = {
 const matchAllLignesServerFn = createServerFn({ method: "POST" })
   .validator((marcheId: string) => marcheId)
   .handler(async ({ data: marcheId }): Promise<MatchAllResult> => {
-    const { data: lignes, error: lignesError } = await supabase
+    // NOTE ON supabaseAdmin
+    // ------------------------------------------------------------------
+    // The plain `supabase` client (src/integrations/supabase/client.ts)
+    // has no server-side session storage — `storage` resolves to
+    // `undefined` whenever `window` is undefined — so any createServerFn
+    // handler using it always runs as an anonymous request. marche_lignes,
+    // bid_lignes and materiel_catalogue all have a `auth.uid() IS NOT
+    // NULL` SELECT policy, so those reads were silently returning zero
+    // rows here (not an error — RLS just filters everything out), which
+    // is what made ranking look like it always found no candidates.
+    // supabaseAdmin (service role) bypasses RLS; safe to use for these
+    // reads since this handler only reads shared marché/catalogue data,
+    // nothing user-scoped.
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: lignes, error: lignesError } = await supabaseAdmin
       .from("marche_lignes")
       .select("id, numero, designation, unite, quantite, chapitre_ou_zone")
       .eq("marche_id", marcheId);
     if (lignesError) throw lignesError;
     if (!lignes || lignes.length === 0) return { candidatesByLigne: {} };
 
-    const { data: bidLignes, error: bidError } = await supabase
+    const { data: bidLignes, error: bidError } = await supabaseAdmin
       .from("bid_lignes")
       .select("marche_ligne_id, statut")
       .in(
@@ -151,7 +166,7 @@ const matchAllLignesServerFn = createServerFn({ method: "POST" })
     // The full real materiel_catalogue, not a subset — exactly what
     // rankandSelect's CatalogueIndex/rankCandidates pipeline expects to be
     // built from.
-    const { data: catalogue, error: catalogueError } = await supabase
+    const { data: catalogue, error: catalogueError } = await supabaseAdmin
       .from("materiel_catalogue")
       .select("*, fournisseurs:fournisseur_id(id, nom)")
       .eq("statut", "verifie");
@@ -220,7 +235,7 @@ const matchAllLignesServerFn = createServerFn({ method: "POST" })
     });
 
     if (upserts.length > 0) {
-      const { error: upsertError } = await supabase
+      const { error: upsertError } = await supabaseAdmin
         .from("bid_lignes")
         .upsert(upserts, { onConflict: "marche_ligne_id" });
       if (upsertError) throw upsertError;
@@ -246,7 +261,13 @@ const matchAllLignesServerFn = createServerFn({ method: "POST" })
 const rankLigneCandidatesServerFn = createServerFn({ method: "POST" })
   .validator((marcheLigneId: string) => marcheLigneId)
   .handler(async ({ data: marcheLigneId }): Promise<{ candidates: RankedCandidate[] }> => {
-    const { data: ligne, error: ligneError } = await supabase
+    // See NOTE ON supabaseAdmin in matchAllLignesServerFn above — same
+    // reason: the plain `supabase` client has no session server-side, so
+    // marche_lignes/materiel_catalogue's `auth.uid() IS NOT NULL` SELECT
+    // policies were silently zeroing out both reads below.
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: ligne, error: ligneError } = await supabaseAdmin
       .from("marche_lignes")
       .select("designation, unite, quantite, chapitre_ou_zone")
       .eq("id", marcheLigneId)
@@ -254,7 +275,7 @@ const rankLigneCandidatesServerFn = createServerFn({ method: "POST" })
     if (ligneError) throw ligneError;
     if (!ligne) return { candidates: [] };
 
-    const { data: catalogue, error: catalogueError } = await supabase
+    const { data: catalogue, error: catalogueError } = await supabaseAdmin
       .from("materiel_catalogue")
       .select("*, fournisseurs:fournisseur_id(id, nom)")
       .eq("statut", "verifie");

@@ -10,6 +10,7 @@ import {
   StyleSheet,
   renderToBuffer,
 } from "@react-pdf/renderer";
+import { isRemiseActive, remiseMontant, type Remise } from "@/lib/bordereauRemises";
 
 // ---------------------------------------------------------------------------
 // Data contract
@@ -39,6 +40,13 @@ export interface BordereauPdfChapitre {
   numeroRomain: string;
   nom: string;
   lignes: BordereauPdfLigne[];
+  /** Chapter subtotal before this chapter's own remise is applied. */
+  sousTotalBrut: number;
+  /** This chapter's discount, if any. Null/absent = no discount. */
+  remise: Remise | null;
+  /** Chapter subtotal AFTER this chapter's remise — this is the number
+   *  that feeds into the grand total. Equals sousTotalBrut when remise
+   *  is inactive. */
   sousTotal: number;
 }
 
@@ -64,6 +72,14 @@ export interface BordereauPdfData {
    *  document. Omitted entirely (no blank page) when not provided. */
   preambule?: string[];
   chapitres: BordereauPdfChapitre[];
+  /** Sum of chapitres[].sousTotal (i.e. after chapter remises, before the
+   *  global remise). Only meaningful to show when remiseGlobale is
+   *  active — otherwise it equals totalHt and is redundant. */
+  totalHtBrut: number;
+  /** The overall discount, if any, applied on top of totalHtBrut. */
+  remiseGlobale: Remise | null;
+  /** Final total HT — after every chapter remise AND the global remise.
+   *  This is what TVA is computed on. */
   totalHt: number;
   tvaPct: number;
   totalTva: number;
@@ -116,6 +132,11 @@ function formatDate(value: string | null): string {
     month: "short",
     year: "numeric",
   });
+}
+
+/** "10%" or "50.000 DT" — used in remise row labels. */
+function formatRemiseLabel(remise: Remise): string {
+  return remise.type === "pourcentage" ? `${frNumber(remise.valeur, 0, 2)}%` : formatDinars(remise.valeur);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +268,19 @@ const styles = StyleSheet.create({
     fontFamily: "Helvetica-Bold",
     marginTop: 1,
   },
+  remiseRow: {
+    flexDirection: "row",
+    paddingVertical: 1.5,
+    fontSize: 7.5,
+    color: "#555555",
+  },
+  remiseRowBrut: {
+    flexDirection: "row",
+    paddingVertical: 1.5,
+    fontSize: 7.5,
+    color: "#888888",
+    textDecoration: "line-through",
+  },
   cellNumero: { width: COLS.numero, color: "#555555" },
   cellDesignation: { width: COLS.designation, paddingRight: 4 },
   cellDesignationArticle: {
@@ -291,6 +325,15 @@ const styles = StyleSheet.create({
   },
   recapChapitreLabel: { maxWidth: 400 },
   recapChapitreValue: { fontFamily: "Helvetica-Bold" },
+  recapRemiseRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingVertical: 1.5,
+    paddingLeft: 8,
+    fontSize: 7.5,
+    color: "#888888",
+    fontStyle: "italic",
+  },
   recapTotalsBlock: { marginTop: 14 },
   recapTotalRow: {
     flexDirection: "row",
@@ -436,7 +479,13 @@ function LigneBlock({ ligne }: { ligne: BordereauPdfLigne }) {
   );
 }
 
+// Width of the "label" span used by the remise/sous-total rows — numero
+// through prixUnitaire combined, so only the prixTotal column carries a
+// value, matching how sousTotalRow already lays out S/TOTAL.
+const REMISE_LABEL_WIDTH = COLS.numero + COLS.designation + COLS.unite + COLS.quantite + COLS.prixUnitaire;
+
 function ChapitreBlock({ chapitre }: { chapitre: BordereauPdfChapitre }) {
+  const hasRemise = isRemiseActive(chapitre.remise);
   return (
     <View>
       <View style={styles.chapitreRow} wrap={false}>
@@ -447,8 +496,26 @@ function ChapitreBlock({ chapitre }: { chapitre: BordereauPdfChapitre }) {
       {chapitre.lignes.map((ligne, i) => (
         <LigneBlock key={`${chapitre.numeroRomain}-${i}`} ligne={ligne} />
       ))}
+      {hasRemise && (
+        <View style={styles.remiseRowBrut} wrap={false}>
+          <Text style={[styles.cellNumero, { width: REMISE_LABEL_WIDTH }]}>
+            Sous-total brut ({chapitre.numeroRomain})
+          </Text>
+          <Text style={styles.cellPrixTotal}>{formatDinars(chapitre.sousTotalBrut)}</Text>
+        </View>
+      )}
+      {hasRemise && (
+        <View style={styles.remiseRow} wrap={false}>
+          <Text style={[styles.cellNumero, { width: REMISE_LABEL_WIDTH }]}>
+            Remise ({formatRemiseLabel(chapitre.remise!)})
+          </Text>
+          <Text style={styles.cellPrixTotal}>
+            -{formatDinars(remiseMontant(chapitre.sousTotalBrut, chapitre.remise))}
+          </Text>
+        </View>
+      )}
       <View style={styles.sousTotalRow} wrap={false}>
-        <Text style={[styles.cellNumero, { width: COLS.numero + COLS.designation + COLS.unite + COLS.quantite + COLS.prixUnitaire }]}>
+        <Text style={[styles.cellNumero, { width: REMISE_LABEL_WIDTH }]}>
           S/TOTAL ({chapitre.numeroRomain})
         </Text>
         <Text style={styles.cellPrixTotal}>{formatDinars(chapitre.sousTotal)}</Text>
@@ -490,6 +557,7 @@ function PreamblePage({ data }: { data: BordereauPdfData }) {
 // Recap page
 // ---------------------------------------------------------------------------
 function RecapPage({ data }: { data: BordereauPdfData }) {
+  const hasRemiseGlobale = isRemiseActive(data.remiseGlobale);
   return (
     <Page size="A4" style={styles.page}>
       <PageHeader data={data} />
@@ -500,16 +568,41 @@ function RecapPage({ data }: { data: BordereauPdfData }) {
         {data.chantierNom} · LOT: {data.lot}
       </Text>
 
-      {data.chapitres.map((chapitre) => (
-        <View key={chapitre.numeroRomain} style={styles.recapRow} wrap={false}>
-          <Text style={styles.recapChapitreLabel}>
-            {chapitre.numeroRomain} — {chapitre.nom} (S/Total {chapitre.numeroRomain})
-          </Text>
-          <Text style={styles.recapChapitreValue}>{formatDinars(chapitre.sousTotal)}</Text>
-        </View>
-      ))}
+      {data.chapitres.map((chapitre) => {
+        const hasChapitreRemise = isRemiseActive(chapitre.remise);
+        return (
+          <View key={chapitre.numeroRomain}>
+            <View style={styles.recapRow} wrap={false}>
+              <Text style={styles.recapChapitreLabel}>
+                {chapitre.numeroRomain} — {chapitre.nom} (S/Total {chapitre.numeroRomain})
+              </Text>
+              <Text style={styles.recapChapitreValue}>{formatDinars(chapitre.sousTotal)}</Text>
+            </View>
+            {hasChapitreRemise && (
+              <View style={styles.recapRemiseRow} wrap={false}>
+                <Text>
+                  dont remise {formatRemiseLabel(chapitre.remise!)} sur {formatDinars(chapitre.sousTotalBrut)}
+                </Text>
+                <Text>-{formatDinars(remiseMontant(chapitre.sousTotalBrut, chapitre.remise))}</Text>
+              </View>
+            )}
+          </View>
+        );
+      })}
 
       <View style={styles.recapTotalsBlock}>
+        {hasRemiseGlobale && (
+          <>
+            <View style={styles.recapTotalRow}>
+              <Text>Sous-total (après remises chapitres)</Text>
+              <Text>{formatDinars(data.totalHtBrut)}</Text>
+            </View>
+            <View style={styles.recapTotalRow}>
+              <Text>Remise globale ({formatRemiseLabel(data.remiseGlobale!)})</Text>
+              <Text>-{formatDinars(remiseMontant(data.totalHtBrut, data.remiseGlobale))}</Text>
+            </View>
+          </>
+        )}
         <View style={styles.recapTotalRow}>
           <Text>TOTAL GÉNÉRAL (H.T.V.A)</Text>
           <Text>{formatDinars(data.totalHt)}</Text>

@@ -100,7 +100,7 @@ function pushChapitreRow(b: SheetBuilder, chapitre: BordereauPdfChapitre): void 
 }
 
 function pushLigneRow(b: SheetBuilder, ligne: BordereauPdfLigne): void {
-  const designation = ligne.isArticle ? `Fourniture: ${ligne.designation}` : ligne.designation;
+  const designation = ligne.isArticle ? `\u203A ${ligne.designation}` : ligne.designation;
   const styles: Record<number, Record<string, unknown>> = {
     0: { font: FONT_NUMERO, alignment: { horizontal: "center", vertical: "top" } },
     1: { font: FONT_BODY, alignment: { horizontal: "left", vertical: "top", wrapText: true } },

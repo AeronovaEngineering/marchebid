@@ -59,9 +59,9 @@ function SidebarContent({ user, onSignOut, onLinkClick }: SidebarContentProps) {
         </div>
         <div className="leading-tight">
           <p className="text-sm font-semibold text-sidebar-accent-foreground">
-            AeroNova BID
+            AeroNova Engineering
           </p>
-          <p className="text-[11px] text-sidebar-foreground/60">Bureau d'études</p>
+          <p className="text-[11px] text-sidebar-foreground/60">Cabinet de Consulting</p>
         </div>
       </div>
 

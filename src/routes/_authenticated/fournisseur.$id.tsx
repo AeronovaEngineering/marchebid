@@ -63,6 +63,7 @@ type CatalogueItem = {
   specs: Record<string, any>;
   statut: "verifie" | "brouillon";
   date_maj: string;
+  created_at: string;
   image_url?: string | null;
 };
 
@@ -105,7 +106,7 @@ const catalogueItemsQuery = (fournisseurId: string) => ({
       .from("materiel_catalogue")
       .select("*")
       .eq("fournisseur_id", fournisseurId)
-      .order("designation", { ascending: true });
+      .order("date_maj", { ascending: false });
 
     if (error) throw error;
     return (data || []) as CatalogueItem[];
@@ -433,6 +434,18 @@ function FournisseurDetailComponent() {
   };
 
   const isStockAvailable = (statut: string) => statut === "verifie";
+
+  // date_maj is set to now() on every edit (see updateItemMutation /
+  // toggleStockMutation) but not on creation, so if it still matches
+  // created_at, the item has never actually been touched since import.
+  const wasEditedSinceCreation = (item: CatalogueItem) => item.date_maj !== item.created_at;
+
+  const formatModifiedDate = (isoDate: string) =>
+    new Date(isoDate).toLocaleDateString("fr-FR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    });
 
   // ============================================================
   // RENDER - LOADING
@@ -829,7 +842,17 @@ function FournisseurDetailComponent() {
                           </>
                         ) : (
                           <>
-                            <td className="px-3 py-3 font-medium">{item.designation}</td>
+                            <td className="px-3 py-3 font-medium">
+                              {item.designation}
+                              {wasEditedSinceCreation(item) && (
+                                <Badge
+                                  variant="outline"
+                                  className="ml-2 align-middle text-[10px] font-normal text-muted-foreground"
+                                >
+                                  Modifié le {formatModifiedDate(item.date_maj)}
+                                </Badge>
+                              )}
+                            </td>
                             <td className="px-3 py-3 text-muted-foreground">
                               {item.categorie || "—"}
                             </td>
