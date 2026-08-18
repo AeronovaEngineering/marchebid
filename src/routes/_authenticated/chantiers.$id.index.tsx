@@ -94,17 +94,21 @@ const RESULTAT_LABELS: Record<MarcheResultat, string> = {
   perdu: "Perdu",
 };
 
-// Chantier-level status — same value set StatutBadge already renders for
-// kind="chantier" (see RecapMarchePage's badge + CLOSED_STATUTS above).
-// "gagne" freezes every marché under this chantier from further edits (see
-// isLocked in the "Marchés" tab below), so changing it here has real
-// consequences elsewhere in the app, not just a label change.
-type ChantierStatut = "brouillon" | "en_cours" | "gagne" | "perdu";
+// Chantier-level status — same 5-value vocabulary as the chantier_statut
+// Postgres enum (see supabase/migrations/202608120900000_chantiers_statut.sql,
+// which collapsed the old 4-value set into this one: soumis -> propose,
+// gagne -> en_cours) and already used by StatutBadge.tsx and
+// chantiers.index.tsx. "gagne" no longer exists as a chantiers.statut value
+// — winning a marché now derives statut = 'en_cours', not a dedicated
+// "gagne" status, so locking marchés below is keyed off each marché's own
+// `resultat`, not chantier.statut (see isLocked further down).
+type ChantierStatut = "brouillon" | "propose" | "en_cours" | "termine" | "perdu";
 
 const CHANTIER_STATUT_LABELS: Record<ChantierStatut, string> = {
   brouillon: "Brouillon",
+  propose: "Proposé",
   en_cours: "En cours",
-  gagne: "Gagné",
+  termine: "Terminé",
   perdu: "Perdu",
 };
 
@@ -308,6 +312,20 @@ function ChantierDetailPage() {
 
   const hasMultipleMarches = (marches?.length ?? 0) > 1;
 
+  // A marché at 100% is simply ready for the recap/PDF step — it can still
+  // be reopened and edited freely. Only a *won* marché freezes every
+  // marché under the same chantier from further edits.
+  //
+  // This used to be keyed off chantier.statut === "gagne", but "gagne" is
+  // not a chantiers.statut value anymore (see ChantierStatut above) — a
+  // won marché now derives chantier.statut = 'en_cours', a value that can
+  // also be picked manually at chantier creation with no marché won at
+  // all (see chantiers.index.tsx). Using it here would lock chantiers that
+  // were never actually won. Deriving the lock from each marché's own
+  // `resultat` instead is more precise and matches the original intent
+  // ("a won marché freezes").
+  const chantierHasMarcheGagne = (marches ?? []).some((m) => m.resultat === "gagne");
+
   const suiviLignesFiltered = useMemo(() => {
     if (!hasMultipleMarches || suiviLotFilter === "all") return lignesConfirmeesSuivi;
     return lignesConfirmeesSuivi.filter((row) => row.marche_id === suiviLotFilter);
@@ -442,8 +460,9 @@ function ChantierDetailPage() {
         entity_id: id,
         details: { statut: value },
       });
-      // "gagne" locks every marché below (see isLocked in the Marchés tab),
-      // so other queries derived from this chantier need a refresh too.
+      // The chantier statut isn't what locks marchés anymore (see
+      // chantierHasMarcheGagne above), but other queries derived from this
+      // chantier still deserve a refresh after a manual statut change.
       await queryClient.invalidateQueries({ queryKey: ["marches", id] });
     }
     setUpdatingStatut(false);
@@ -694,11 +713,7 @@ function ChantierDetailPage() {
                 <TableBody>
                   {marchesWithStats.map(({ marche, nbLignes, nbConfirmees, pct }) => {
                     const isComplete = nbLignes > 0 && pct === 100;
-                    // A marché at 100% is simply ready for the recap/PDF
-                    // step — it can still be reopened and edited freely.
-                    // Only a chantier that has been won ('gagne') freezes
-                    // its marchés from further edits.
-                    const isLocked = chantier.statut === "gagne";
+                    const isLocked = chantierHasMarcheGagne;
                     return (
                       <TableRow
                         key={marche.id}
@@ -721,7 +736,7 @@ function ChantierDetailPage() {
                                     <Lock className="size-3.5 text-muted-foreground" />
                                   </TooltipTrigger>
                                   <TooltipContent>
-                                    Chantier gagné : ce marché est verrouillé et ne peut plus être modifié.
+                                    Un marché de ce chantier a été gagné : ce marché est verrouillé et ne peut plus être modifié.
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>

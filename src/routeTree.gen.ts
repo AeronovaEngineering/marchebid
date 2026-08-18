@@ -23,6 +23,7 @@ import { Route as AuthenticatedChantiersIndexRouteImport } from './routes/_authe
 import { Route as AuthenticatedFournisseurIndexRouteImport } from './routes/_authenticated/fournisseur.index'
 import { Route as AuthenticatedFournisseurIdRouteImport } from './routes/_authenticated/fournisseur.$id'
 import { Route as AuthenticatedChantiersIdIndexRouteImport } from './routes/_authenticated/chantiers.$id.index'
+import { Route as AuthenticatedChantiersIdRecapMarcheIdRouteImport } from './routes/_authenticated/chantiers.$id.recap.$marcheId'
 import { Route as AuthenticatedChantiersIdRemplirMarcheIdRouteImport } from './routes/_authenticated/chantiers.$id.remplir.$marcheId'
 
 const IndexRoute = IndexRouteImport.update({
@@ -99,6 +100,12 @@ const AuthenticatedChantiersIdIndexRoute =
     path: '/chantiers/$id/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
+const AuthenticatedChantiersIdRecapMarcheIdRoute =
+  AuthenticatedChantiersIdRecapMarcheIdRouteImport.update({
+    id: '/chantiers/$id/recap/$marcheId',
+    path: '/chantiers/$id/recap/$marcheId',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedChantiersIdRemplirMarcheIdRoute =
   AuthenticatedChantiersIdRemplirMarcheIdRouteImport.update({
     id: '/chantiers/$id/remplir/$marcheId',
@@ -120,6 +127,7 @@ export interface FileRoutesByFullPath {
   '/chantiers/': typeof AuthenticatedChantiersIndexRoute
   '/fournisseur/': typeof AuthenticatedFournisseurIndexRoute
   '/chantiers/$id/': typeof AuthenticatedChantiersIdIndexRoute
+  '/chantiers/$id/recap/$marcheId': typeof AuthenticatedChantiersIdRecapMarcheIdRoute
   '/chantiers/$id/remplir/$marcheId': typeof AuthenticatedChantiersIdRemplirMarcheIdRoute
 }
 export interface FileRoutesByTo {
@@ -136,6 +144,7 @@ export interface FileRoutesByTo {
   '/chantiers': typeof AuthenticatedChantiersIndexRoute
   '/fournisseur': typeof AuthenticatedFournisseurIndexRoute
   '/chantiers/$id': typeof AuthenticatedChantiersIdIndexRoute
+  '/chantiers/$id/recap/$marcheId': typeof AuthenticatedChantiersIdRecapMarcheIdRoute
   '/chantiers/$id/remplir/$marcheId': typeof AuthenticatedChantiersIdRemplirMarcheIdRoute
 }
 export interface FileRoutesById {
@@ -154,6 +163,7 @@ export interface FileRoutesById {
   '/_authenticated/chantiers/': typeof AuthenticatedChantiersIndexRoute
   '/_authenticated/fournisseur/': typeof AuthenticatedFournisseurIndexRoute
   '/_authenticated/chantiers/$id/': typeof AuthenticatedChantiersIdIndexRoute
+  '/_authenticated/chantiers/$id/recap/$marcheId': typeof AuthenticatedChantiersIdRecapMarcheIdRoute
   '/_authenticated/chantiers/$id/remplir/$marcheId': typeof AuthenticatedChantiersIdRemplirMarcheIdRoute
 }
 export interface FileRouteTypes {
@@ -172,6 +182,7 @@ export interface FileRouteTypes {
     | '/chantiers/'
     | '/fournisseur/'
     | '/chantiers/$id/'
+    | '/chantiers/$id/recap/$marcheId'
     | '/chantiers/$id/remplir/$marcheId'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -188,6 +199,7 @@ export interface FileRouteTypes {
     | '/chantiers'
     | '/fournisseur'
     | '/chantiers/$id'
+    | '/chantiers/$id/recap/$marcheId'
     | '/chantiers/$id/remplir/$marcheId'
   id:
     | '__root__'
@@ -205,6 +217,7 @@ export interface FileRouteTypes {
     | '/_authenticated/chantiers/'
     | '/_authenticated/fournisseur/'
     | '/_authenticated/chantiers/$id/'
+    | '/_authenticated/chantiers/$id/recap/$marcheId'
     | '/_authenticated/chantiers/$id/remplir/$marcheId'
   fileRoutesById: FileRoutesById
 }
@@ -314,6 +327,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedChantiersIdIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/chantiers/$id/recap/$marcheId': {
+      id: '/_authenticated/chantiers/$id/recap/$marcheId'
+      path: '/chantiers/$id/recap/$marcheId'
+      fullPath: '/chantiers/$id/recap/$marcheId'
+      preLoaderRoute: typeof AuthenticatedChantiersIdRecapMarcheIdRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/chantiers/$id/remplir/$marcheId': {
       id: '/_authenticated/chantiers/$id/remplir/$marcheId'
       path: '/chantiers/$id/remplir/$marcheId'
@@ -336,6 +356,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedChantiersIndexRoute: typeof AuthenticatedChantiersIndexRoute
   AuthenticatedFournisseurIndexRoute: typeof AuthenticatedFournisseurIndexRoute
   AuthenticatedChantiersIdIndexRoute: typeof AuthenticatedChantiersIdIndexRoute
+  AuthenticatedChantiersIdRecapMarcheIdRoute: typeof AuthenticatedChantiersIdRecapMarcheIdRoute
   AuthenticatedChantiersIdRemplirMarcheIdRoute: typeof AuthenticatedChantiersIdRemplirMarcheIdRoute
 }
 
@@ -351,6 +372,8 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedChantiersIndexRoute: AuthenticatedChantiersIndexRoute,
   AuthenticatedFournisseurIndexRoute: AuthenticatedFournisseurIndexRoute,
   AuthenticatedChantiersIdIndexRoute: AuthenticatedChantiersIdIndexRoute,
+  AuthenticatedChantiersIdRecapMarcheIdRoute:
+    AuthenticatedChantiersIdRecapMarcheIdRoute,
   AuthenticatedChantiersIdRemplirMarcheIdRoute:
     AuthenticatedChantiersIdRemplirMarcheIdRoute,
 }

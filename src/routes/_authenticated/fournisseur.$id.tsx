@@ -35,6 +35,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { CatalogueItemForm } from "@/components/CatalogueItemForm";
+import { PriceHistoryDialog } from "@/components/PriceHistoryDialog";
 import { cn } from "@/lib/utils";
 import { formatDinars } from "@/lib/format";
 
@@ -876,6 +877,12 @@ function FournisseurDetailComponent() {
                             </td>
                             <td className="px-3 py-3 text-right">
                               <div className="flex items-center justify-end gap-1">
+                                <PriceHistoryDialog
+                                  materielCatalogueId={item.id}
+                                  designation={item.designation}
+                                  buttonClassName="h-7 w-7"
+                                  iconClassName="size-3.5"
+                                />
                                 <Button
                                   size="sm"
                                   variant="ghost"

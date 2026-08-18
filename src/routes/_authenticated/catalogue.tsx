@@ -47,6 +47,7 @@ import {
 } from "@/components/ui/sheet";
 import { CatalogueItemForm } from "@/components/CatalogueItemForm";
 import { CatalogueImportPanel } from "@/components/Catalogueimportpanel";
+import { PriceHistoryDialog } from "@/components/PriceHistoryDialog";
 import { logActivity } from "@/lib/Activitylog";
 import { cn } from "@/lib/utils";
 import { formatDinars } from "@/lib/format";
@@ -739,14 +740,20 @@ function CatalogueComponent() {
                         </Badge>
                       </td>
                       <td className="px-4 py-3 text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => openEditDialog(item)}
-                          className="h-8 w-8 p-0"
-                        >
-                          <Edit2 className="size-4" />
-                        </Button>
+                        <div className="flex items-center justify-end gap-1">
+                          <PriceHistoryDialog
+                            materielCatalogueId={item.id}
+                            designation={item.designation}
+                          />
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => openEditDialog(item)}
+                            className="h-8 w-8 p-0"
+                          >
+                            <Edit2 className="size-4" />
+                          </Button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -878,17 +885,24 @@ function CatalogueCard({ item, onEdit }: { item: CatalogueItem; onEdit: () => vo
           ) : (
             <ImageIcon className="size-12 text-muted-foreground/30" />
           )}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="absolute top-2 right-2 h-8 w-8 p-0 bg-background/80 hover:bg-background"
-            onClick={(e) => {
-              e.stopPropagation();
-              onEdit();
-            }}
-          >
-            <Edit2 className="size-4" />
-          </Button>
+          <div className="absolute top-2 right-2 flex items-center gap-1">
+            <PriceHistoryDialog
+              materielCatalogueId={item.id}
+              designation={item.designation}
+              buttonClassName="bg-background/80 hover:bg-background"
+            />
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 w-8 p-0 bg-background/80 hover:bg-background"
+              onClick={(e) => {
+                e.stopPropagation();
+                onEdit();
+              }}
+            >
+              <Edit2 className="size-4" />
+            </Button>
+          </div>
         </div>
 
         <div className="space-y-2">
