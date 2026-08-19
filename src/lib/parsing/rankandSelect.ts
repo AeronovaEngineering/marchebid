@@ -26,12 +26,37 @@ export interface ScoredCandidate {
   catalogueItem: CatalogueItem;
   categoryScore: number;
   textScore: number;
+  /** Structured-spec match against the candidate's real specs JSONB — see
+   *  computeSpecMatchScore. Primary ranking signal whenever the ligne's
+   *  local extraction found usable specs; 0 (no signal) otherwise.
+   *  +2 per genuinely matching key/value, -1 per key present on both
+   *  sides that disagrees, 0 for a key present on only one side (missing
+   *  data isn't evidence of a mismatch), plus a small mots_cles bonus. */
+  specMatchScore: number;
+  /** True when at least one structured spec (diamètre, pression, etc.)
+   *  genuinely matched between the ligne and this candidate. Used to
+   *  floor candidates that only conflict — see allSpecsConflict. */
+  hasGenuineSpecMatch: boolean;
+  /** True when there was at least one comparable structured spec AND
+   *  every one of them disagreed (no genuine match at all) — this
+   *  candidate actively conflicts on everything that could be checked.
+   *  Such a candidate must rank below any candidate with even one
+   *  genuine match, regardless of price or text score: a candidate
+   *  that's simply silent on a spec is not worse than one that's
+   *  actively wrong about it. */
+  allSpecsConflict: boolean;
   price: number;
 }
 
 export interface Decision {
   chosen_catalogue_id: string | null;
-  confidence: "high" | "medium" | "low";
+  /** "none" means no real candidate was available to choose from (empty
+   *  candidate pool, a category with zero catalogue matches, or a failed
+   *  selection call) — chosen_catalogue_id is null and nothing was
+   *  actually evaluated. "low" is reserved for a genuine, evaluated match
+   *  that just isn't a strong one; conflating the two misleads callers
+   *  into treating "we found nothing" the same as "we found a weak fit". */
+  confidence: "high" | "medium" | "low" | "none";
   justification: string;
 }
 
@@ -153,6 +178,400 @@ function flattenSpecs(specs: Record<string, unknown> | null | undefined): string
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Local (no-network) spec extraction — pure regex/keyword extraction of
+//     structured data out of a marche_ligne's designation text. Produces the
+//     exact same shape a future Haiku-based extractor would produce, so
+//     rankCandidates/selectWithHaiku never need to know which one actually
+//     ran for a given import job: swap this out for an LLM call later
+//     without touching anything downstream.
+// ---------------------------------------------------------------------------
+export interface ExtractedLigneSpecs {
+  categorie: string | null;
+  sous_categorie: string | null;
+  mots_cles: string[];
+  specs: Record<string, string>;
+}
+
+/** Diamètre — "ø 100", "ø100", "ø intérieur 12", "ø extérieur 16",
+ *  "DN 25", "DN15/20", "diamètre 1''". DN checked first since it's
+ *  unambiguous; the ø/diamètre-word forms fall through in order. */
+function extractDiametre(text: string): string | null {
+  const dn = text.match(/\bDN\s*(\d+(?:\s*\/\s*\d+)?)/i);
+  if (dn) return `DN${(dn[1] ?? "").replace(/\s+/g, "")}`;
+
+  const oe = text.match(/[øØ]\s*(int[ée]rieur|ext[ée]rieur)?\s*(\d+(?:[.,]\d+)?)\s*(mm|cm)?/i);
+  if (oe) {
+    const qualifier = oe[1] ? `${stripAccents(oe[1]).toLowerCase()} ` : "";
+    const unit = oe[3] ? oe[3].toLowerCase() : "mm";
+    return `ø ${qualifier}${oe[2]}${unit}`;
+  }
+
+  // "diamètre 1''" / "diamètre 1 pouce" — inch forms, checked before the
+  // plain-number fallback below.
+  const inch = text.match(/diam[eè]tre\s*(?:de\s*)?(\d+(?:[.,]\d+)?)\s*(''|"|pouces?\b|po\b)/i);
+  if (inch) return `${inch[1]}''`;
+
+  const word = text.match(/diam[eè]tre\s*(?:de\s*)?(\d+(?:[.,]\d+)?)\s*(mm|cm)?/i);
+  if (word) return `${word[1]}${word[2] ?? "mm"}`;
+
+  return null;
+}
+
+/** Débit — "100m3/h", "300 m3/h", "débit 2m3/h", "débit de 60 à 100m3/h". */
+function extractDebit(text: string): string | null {
+  const range = text.match(
+    /d[ée]bit\s*(?:de\s*)?(\d+(?:[.,]\d+)?)\s*[àa]\s*(\d+(?:[.,]\d+)?)\s*m\s*[3³]\s*\/\s*h/i
+  );
+  if (range) return `${range[1]} à ${range[2]} m3/h`;
+
+  const single = text.match(/(\d+(?:[.,]\d+)?)\s*m\s*[3³]\s*\/\s*h/i);
+  if (single) return `${single[1]}m3/h`;
+
+  return null;
+}
+
+/** Pression — "10 bar", "10Bars", "PN16", "PN 10". */
+function extractPression(text: string): string | null {
+  const pn = text.match(/\bPN\s*(\d+(?:[.,]\d+)?)/i);
+  if (pn) return `PN${pn[1]}`;
+
+  const bar = text.match(/(\d+(?:[.,]\d+)?)\s*bars?\b/i);
+  if (bar) return `${bar[1]}bar`;
+
+  return null;
+}
+
+/** Puissance — "12000 BTU", "300W", "500W". BTU checked first so it isn't
+ *  swallowed by the (deliberately narrow) watt pattern. */
+function extractPuissance(text: string): string | null {
+  const btu = text.match(/(\d+(?:[.,]\d+)?)\s*BTU\b/i);
+  if (btu) return `${btu[1]} BTU`;
+
+  const watt = text.match(/(\d+(?:[.,]\d+)?)\s*[wW](?![a-zA-Z])/);
+  if (watt) return `${watt[1]}W`;
+
+  return null;
+}
+
+/** Dimensions — "150 cm²", "20x20cm", "400x250", "250 x 250". An
+ *  un-suffixed "AxB" is only trusted as a physical dimension when both
+ *  numbers are already in a plausible fixture/duct size range — bare
+ *  small-number "AxB" (e.g. "16x2", "12x1") is the BTP pipe-sizing
+ *  convention for diamètre x épaisseur, not a width x height, and is
+ *  deliberately left alone here rather than mislabeled. */
+function extractDimensions(text: string): string | null {
+  const wh = text.match(/(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)\s*(cm|mm|m)?\b/);
+  if (wh) {
+    const a = parseFloat((wh[1] ?? "").replace(",", "."));
+    const b = parseFloat((wh[2] ?? "").replace(",", "."));
+    const unit = wh[3];
+    if (unit || (a >= 10 && b >= 10)) {
+      return `${wh[1]}x${wh[2]}${unit ?? ""}`;
+    }
+  }
+
+  const area = text.match(/(\d+(?:[.,]\d+)?)\s*cm\s*[²2]/i);
+  if (area) return `${area[1]}cm²`;
+
+  return null;
+}
+
+/** Matériau — first keyword match, checked in list order (not first
+ *  occurring in the text). Matched against the accent-stripped/lowercased
+ *  designation so "acier galvanisé" matches regardless of accents/case. */
+const MATERIAU_KEYWORDS: string[] = [
+  "laiton",
+  "pvc",
+  "cuivre",
+  "acier galvanise",
+  "aluminium",
+  "inox",
+  "bronze",
+  "polyethylene",
+  "multicouche",
+  "ceramique",
+  "acrylique",
+  "porcelaine",
+];
+
+function extractMateriau(normalizedText: string): string | null {
+  for (const kw of MATERIAU_KEYWORDS) {
+    if (normalizedText.includes(kw)) return kw;
+  }
+  return null;
+}
+
+/** Stopwords that show up in nearly every bordereau line and carry no
+ *  distinguishing signal, plus the unit/code tokens that are already
+ *  captured under `specs` above and would just be noise in `mots_cles`. */
+const MOTS_CLES_STOPWORDS = new Set([
+  "fourniture", "fournitures", "pose", "compris", "comprise", "comprises",
+  "non", "toutes", "tout", "toute", "sujetion", "sujetions", "raccordement",
+  "raccordements", "et", "de", "des", "du", "la", "le", "les", "en", "pour",
+  "avec", "sans", "un", "une", "sur", "dans", "par", "y", "ainsi", "que",
+  "ou", "a", "comprenant", "mise", "oeuvre", "execution", "suivant", "selon",
+  "au", "aux", "ce", "cet", "cette", "ses", "leur", "leurs",
+]);
+const MOTS_CLES_UNIT_TOKENS = new Set([
+  "mm", "cm", "m", "m2", "m3", "ml", "kg", "l", "u", "ens", "dn", "pn",
+  "bar", "bars", "btu", "w", "po", "pouce", "pouces",
+]);
+
+/** Pulls the 3-6 most distinctive nouns out of a designation: tokenize,
+ *  drop stopwords/units/short tokens, and drop any token containing a
+ *  digit (measurements and codes already live in `specs`, not here). */
+function extractMotsCles(designation: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of tokenize(designation)) {
+    if (out.length >= 6) break;
+    if (t.length < 3) continue;
+    if (/\d/.test(t)) continue;
+    if (MOTS_CLES_STOPWORDS.has(t) || MOTS_CLES_UNIT_TOKENS.has(t)) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+interface CategoryRule {
+  categorie: string;
+  /** Keywords that identify this categorie, checked against both the
+   *  designation and chapitre_ou_zone tokens. */
+  categoryKeywords: string[];
+  sousCategories: { label: string; keywords: string[] }[];
+}
+
+/** Built from the REAL distinct (categorie, sous_categorie) pairs seeded
+ *  into materiel_catalogue (supabase/migrations/202608070000002_seed.sql)
+ *  — a live `select distinct categorie, sous_categorie from
+ *  materiel_catalogue` wasn't reachable from this sandbox (Supabase isn't
+ *  on the allowed network list here), so this is the real ground truth
+ *  available in-repo. Re-check against the live table once supplier
+ *  imports have added more categories/sous_categories than the seed data
+ *  covers, and extend the rules below to match.
+ *
+ *  Gaz is checked before Tuyauterie/Robinets: real gaz-lot items ("Tube
+ *  cuivre 12x1 (gaz)", "Vanne gaz 1/2\" bronze") would otherwise be
+ *  misclassified purely off the generic word "tube"/"vanne". */
+const CATEGORY_RULES: CategoryRule[] = [
+  {
+    categorie: "Gaz",
+    categoryKeywords: ["gaz"],
+    sousCategories: [
+      { label: "Tuyauterie cuivre", keywords: ["cuivre", "tube", "tuyau"] },
+      { label: "Vannes gaz", keywords: ["vanne"] },
+      { label: "Flexibles", keywords: ["flexible"] },
+    ],
+  },
+  {
+    categorie: "Sanitaires",
+    categoryKeywords: [
+      "lavabo", "baignoire", "wc", "sanitaire", "sanitaires", "douche",
+      "evier", "robinetterie", "mitigeur", "melangeur",
+    ],
+    sousCategories: [
+      { label: "Lavabos", keywords: ["lavabo", "vasque"] },
+      { label: "Baignoires", keywords: ["baignoire", "douche"] },
+      { label: "WC", keywords: ["wc", "toilette", "cuvette"] },
+      { label: "Robinetterie", keywords: ["robinetterie", "mitigeur", "melangeur"] },
+    ],
+  },
+  {
+    categorie: "Ventilation",
+    categoryKeywords: ["extracteur", "gaine", "ventilation", "ventilateur"],
+    sousCategories: [
+      { label: "Extracteurs", keywords: ["extracteur", "ventilateur", "extraction"] },
+      { label: "Gaines", keywords: ["gaine", "conduit"] },
+    ],
+  },
+  {
+    categorie: "Climatisation",
+    categoryKeywords: ["climatiseur", "split", "climatisation"],
+    sousCategories: [{ label: "Splits", keywords: ["split", "climatiseur"] }],
+  },
+  {
+    categorie: "Robinets",
+    categoryKeywords: ["vanne", "robinet", "clapet"],
+    sousCategories: [
+      { label: "Vannes", keywords: ["vanne"] },
+      { label: "Clapets", keywords: ["clapet", "antiretour"] },
+    ],
+  },
+  {
+    categorie: "Tuyauterie",
+    categoryKeywords: ["tuyauterie", "tube", "tuyau", "coude"],
+    sousCategories: [
+      { label: "Multicouche", keywords: ["multicouche", "per", "pex"] },
+      { label: "PVC", keywords: ["pvc"] },
+    ],
+  },
+];
+
+/** Infers categorie/sous_categorie from the keyword table above, checking
+ *  the designation first and falling back to chapitre_ou_zone (a bordereau
+ *  zone label like "Sanitaire"/"Tuyauterie" is itself a strong, often
+ *  literal, category signal). Multi-word keywords (e.g. "acier
+ *  galvanise") are matched as a substring of the normalized text rather
+ *  than as a single token. Leaves both fields null rather than guessing
+ *  when nothing matches confidently. */
+function inferCategorie(
+  designation: string,
+  zone: string | null | undefined
+): { categorie: string | null; sous_categorie: string | null } {
+  const normalizedDesignation = stripAccents(designation).toLowerCase();
+  const designationTokens = new Set(tokenize(designation));
+  const zoneTokens = new Set(tokenize(zone ?? ""));
+
+  const matchesKeyword = (tokens: Set<string>, normalizedText: string, kw: string): boolean =>
+    kw.includes(" ") ? normalizedText.includes(kw) : tokens.has(kw);
+
+  for (const rule of CATEGORY_RULES) {
+    const hitDesignation = rule.categoryKeywords.some((kw) =>
+      matchesKeyword(designationTokens, normalizedDesignation, kw)
+    );
+    const hitZone = rule.categoryKeywords.some((kw) => matchesKeyword(zoneTokens, "", kw));
+    if (!hitDesignation && !hitZone) continue;
+
+    let sous_categorie: string | null = null;
+    for (const sc of rule.sousCategories) {
+      if (sc.keywords.some((kw) => matchesKeyword(designationTokens, normalizedDesignation, kw))) {
+        sous_categorie = sc.label;
+        break;
+      }
+    }
+    return { categorie: rule.categorie, sous_categorie };
+  }
+  return { categorie: null, sous_categorie: null };
+}
+
+function stripAccents(s: string): string {
+  return s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+}
+
+/** Diameter-like spec normalization — parses ø/Φ/DN/diamètre/diam/
+ *  intérieur/extérieur notations down to a plain number in millimetres,
+ *  so two diameter specs can be compared as NUMBERS instead of raw
+ *  strings. That matters in practice: "ø 100mm", "100mm", and "DN100"
+ *  can all describe the same real-world measurement but are three
+ *  different strings, and would wrongly register as a spec conflict
+ *  under exact string comparison. All those prefixes/labels are treated
+ *  as equivalent notations for "this is a diameter" and stripped before
+ *  parsing; DN nominal sizes get no extra conversion since this
+ *  catalogue's DN values are already mm-equivalent. Unit is assumed to
+ *  be mm — this dataset's overwhelming default — unless the value is
+ *  explicitly suffixed with cm (×10) or a bare m (×1000). Inch-denoted
+ *  values ('', ", pouce, po) are left unparsed rather than guessed at:
+ *  converting them would require an interpretation the raw label doesn't
+ *  make explicit, and this function must never guess a unit. Returns
+ *  null when nothing numeric is found — callers must treat that as
+ *  "can't compare", never as a silent 0mm. */
+export function normalizeDiameter(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  let text = stripAccents(String(raw)).toLowerCase();
+
+  if (/(''|"|\bpouces?\b|\bpo\b)/.test(text)) return null;
+
+  text = text
+    .replace(/[øφ]/g, " ")
+    .replace(/diam(?:etre)?/g, " ")
+    .replace(/\bdn/g, " ")
+    .replace(/interieur/g, " ")
+    .replace(/exterieur/g, " ");
+
+  const match = text.match(/(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?/);
+  if (!match) return null;
+
+  const value = parseFloat(match[1].replace(",", "."));
+  if (Number.isNaN(value)) return null;
+
+  if (match[2] === "cm") return value * 10;
+  if (match[2] === "m") return value * 1000;
+  return value;
+}
+
+/** Débit normalization — parses "100m3/h", "débit 100 m3/h", the lower
+ *  bound of a range ("débit de 60 à 100m3/h"), etc. down to a plain
+ *  number in m3/h. This dataset only ever expresses débit in m3/h, so
+ *  there's no unit conversion to do here — the point is purely comparing
+ *  numbers instead of two differently-formatted but numerically
+ *  identical strings. Returns null when nothing numeric is found. */
+export function normalizeDebit(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const text = stripAccents(String(raw)).toLowerCase();
+  const match = text.match(/(\d+(?:[.,]\d+)?)/);
+  if (!match) return null;
+  const value = parseFloat(match[1].replace(",", "."));
+  return Number.isNaN(value) ? null : value;
+}
+
+/** Puissance normalization — parses "300W" / "12000 BTU" down to a plain
+ *  number in watts, converting BTU/h → W (×0.29307107) so a puissance
+ *  expressed in either unit compares as the same underlying quantity
+ *  instead of two incomparable strings. Unlike diamètre, there's no
+ *  implicit default here — the unit tag (W or BTU) is what's present in
+ *  every locally-extracted or catalogue puissance value, so a value with
+ *  neither is left unparsed rather than guessed at. Returns null when
+ *  nothing numeric is found. */
+const BTU_TO_WATTS = 0.29307107;
+
+export function normalizePuissance(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const text = stripAccents(String(raw)).toLowerCase();
+
+  const btu = text.match(/(\d+(?:[.,]\d+)?)\s*btu/);
+  if (btu) {
+    const value = parseFloat(btu[1].replace(",", "."));
+    return Number.isNaN(value) ? null : value * BTU_TO_WATTS;
+  }
+
+  const watt = text.match(/(\d+(?:[.,]\d+)?)\s*w\b/);
+  if (watt) {
+    const value = parseFloat(watt[1].replace(",", "."));
+    return Number.isNaN(value) ? null : value;
+  }
+
+  return null;
+}
+
+/**
+ * Pure, no-network extraction of structured data out of a marche_ligne's
+ * designation (regex + keyword matching only — same shape a future
+ * Haiku-based extractor would produce). Intended as the fast/free default
+ * so the ranking stage (rankCandidates, prompt #2 in selectWithHaiku)
+ * never needs to know or care whether this or an LLM produced the specs
+ * it's scoring against.
+ */
+export function extractLigneSpecsLocal(ligne: MarcheLigne): ExtractedLigneSpecs {
+  const { designation } = ligne;
+  const normalized = stripAccents(designation).toLowerCase();
+
+  const specs: Record<string, string> = {};
+  const diametre = extractDiametre(designation);
+  if (diametre) specs["diametre"] = diametre;
+  const debit = extractDebit(designation);
+  if (debit) specs["debit"] = debit;
+  const pression = extractPression(designation);
+  if (pression) specs["pression"] = pression;
+  const puissance = extractPuissance(designation);
+  if (puissance) specs["puissance"] = puissance;
+  const dimensions = extractDimensions(designation);
+  if (dimensions) specs["dimensions"] = dimensions;
+  const materiau = extractMateriau(normalized);
+  if (materiau) specs["materiau"] = materiau;
+
+  const { categorie, sous_categorie } = inferCategorie(designation, ligne.chapitre_ou_zone);
+
+  return {
+    categorie,
+    sous_categorie,
+    mots_cles: extractMotsCles(designation),
+    specs,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 4. CatalogueIndex — preprocess the catalogue ONCE, reuse across every
 //    marche_ligne in the import job. This is the main scale lever: with a
 //    500+ item catalogue and a few hundred lines to process, doing unit
@@ -260,28 +679,250 @@ export class CatalogueIndex {
 // ---------------------------------------------------------------------------
 // 5. Candidate scoring & ranking
 // ---------------------------------------------------------------------------
+
+/** A handful of local-extractor keys don't literally match the catalogue's
+ *  own key names even though they mean the same spec — e.g.
+ *  extractLigneSpecsLocal emits `materiau` (per its own spec) while
+ *  materiel_catalogue.specs uses `materiel` (see seed data: {"materiel":
+ *  "laiton", ...}). Checked in order; first alias present on the
+ *  candidate wins. */
+const SPEC_KEY_ALIASES: Record<string, string[]> = {
+  materiau: ["materiau", "materiel"],
+};
+
+function specKeyAliases(key: string): string[] {
+  return SPEC_KEY_ALIASES[key] ?? [key];
+}
+
+/** Human-readable French labels for the local extractor's spec keys, used
+ *  only to render localAutoSelect's generated justification text below. */
+const SPEC_LABELS: Record<string, string> = {
+  diametre: "diamètre",
+  debit: "débit",
+  pression: "pression",
+  puissance: "puissance",
+  dimensions: "dimensions",
+  materiau: "matériau",
+};
+
+function normalizeSpecValue(v: unknown): string {
+  return stripAccents(String(v).toLowerCase()).replace(/\s+/g, "");
+}
+
+interface NumericSpecComparer {
+  normalize: (raw: unknown) => number | null;
+  tolerance: number;
+}
+
+/** Spec keys that are fundamentally numeric measurements, compared as
+ *  numbers-with-tolerance instead of raw-string equality (see
+ *  normalizeDiameter/normalizeDebit/normalizePuissance above) — DN
+ *  nominal sizes vs. actual mm measurements, or two independently
+ *  formatted "100m3/h" strings, aren't always bit-identical for the same
+ *  real-world fitting, so a small tolerance avoids treating that
+ *  formatting noise as a genuine spec conflict. Tolerances are in each
+ *  normalizer's output unit (mm, m3/h, W). */
+const NUMERIC_SPEC_COMPARERS: Record<string, NumericSpecComparer> = {
+  diametre: { normalize: (v) => normalizeDiameter(String(v)), tolerance: 1 },
+  debit: { normalize: (v) => normalizeDebit(String(v)), tolerance: 1 },
+  puissance: { normalize: (v) => normalizePuissance(String(v)), tolerance: 50 },
+};
+
+type SpecComparison = "match" | "conflict" | "neutral";
+
+/** Single source of truth for "do these two spec values, under this key,
+ *  agree" — used by computeSpecMatchScore (ranking), explainSpecMatch
+ *  (debug trace), and matchedSpecEntries (justification text) so all
+ *  three always reach the same verdict. Numeric spec keys are parsed
+ *  through their normalizer and compared as numbers within a small
+ *  tolerance; everything else (matériau, dimensions, ...) falls back to
+ *  exact normalized-string equality. "neutral" means a numeric value on
+ *  either side couldn't be parsed at all (e.g. an inch-denoted diamètre)
+ *  — that's not evidence of a match OR a conflict, so it must never
+ *  contribute to the score or the all-conflict tier; it's treated the
+ *  same as the key being absent. */
+function compareSpecValues(key: string, ligneValueRaw: unknown, candidateValueRaw: unknown): SpecComparison {
+  const numeric = NUMERIC_SPEC_COMPARERS[key];
+  if (numeric) {
+    const ligneNum = numeric.normalize(ligneValueRaw);
+    const candidateNum = numeric.normalize(candidateValueRaw);
+    if (ligneNum === null || candidateNum === null) return "neutral";
+    return Math.abs(ligneNum - candidateNum) <= numeric.tolerance ? "match" : "conflict";
+  }
+  return normalizeSpecValue(ligneValueRaw) === normalizeSpecValue(candidateValueRaw) ? "match" : "conflict";
+}
+
+/**
+ * Compares the ligne's locally-extracted specs against a candidate's real
+ * specs JSONB via compareSpecValues (numeric-with-tolerance for
+ * diamètre/débit/puissance, exact normalized-string equality otherwise):
+ * +2 for every key (allowing the aliases above) present on both sides
+ * that agrees, -1 for a key present on both sides whose values genuinely
+ * disagree (a real penalty — being actively wrong on a spec the ligne
+ * cares about is worse than being silent on it, so this must never net
+ * positive), 0 for a key present on only one side or whose numeric value
+ * couldn't be parsed on either side (missing/unparseable data isn't
+ * evidence of a mismatch), plus a +0.5 bonus per mots_cle that literally
+ * appears in the candidate's designation/specs tokens. Also returns
+ * matchedCount/comparedCount over the structured specs alone (mots_cles
+ * excluded, and only over keys that were actually comparable) so callers
+ * can tell "genuinely matched on at least one spec" apart from
+ * "conflicted on every spec that could be checked" — see
+ * ScoredCandidate.hasGenuineSpecMatch / allSpecsConflict. Score is 0
+ * (with comparedCount 0) when the ligne has no specs to compare
+ * (rankCandidates falls back to pure text ranking in that case rather
+ * than trusting an all-zero specMatchScore).
+ */
+interface SpecMatchResult {
+  score: number;
+  matchedCount: number;
+  comparedCount: number;
+}
+
+function computeSpecMatchScore(ligneSpecs: ExtractedLigneSpecs, indexed: IndexedCatalogueItem): SpecMatchResult {
+  let score = 0;
+  let matchedCount = 0;
+  let comparedCount = 0;
+  const candidateSpecs = indexed.item.specs;
+  if (candidateSpecs) {
+    for (const [ligneKey, ligneValueRaw] of Object.entries(ligneSpecs.specs)) {
+      const matchedKey = specKeyAliases(ligneKey).find((ak) =>
+        Object.prototype.hasOwnProperty.call(candidateSpecs, ak)
+      );
+      if (!matchedKey) continue; // key present on only one side -> neutral, not a comparison
+
+      const outcome = compareSpecValues(ligneKey, ligneValueRaw, candidateSpecs[matchedKey]);
+      if (outcome === "neutral") continue; // unparseable numeric value on either side -- can't compare, don't penalize
+
+      comparedCount++;
+      if (outcome === "match") {
+        score += 2;
+        matchedCount++;
+      } else {
+        score -= 1;
+      }
+    }
+  }
+
+  for (const kw of ligneSpecs.mots_cles) {
+    if (indexed.catalogueTokens.has(kw)) score += 0.5;
+  }
+
+  return { score, matchedCount, comparedCount };
+}
+
+export interface SpecMatchBreakdown {
+  score: number;
+  matched: { key: string; value: string }[];
+  disagreeing: { key: string; ligneValue: string; candidateValue: string }[];
+  matchedMotsCles: string[];
+}
+
+/** Same comparison as computeSpecMatchScore, but returns WHICH keys matched
+ *  / disagreed / which mots_cles hit, instead of just a number — for
+ *  debug/trace output only, not used by the ranking hot path. */
+export function explainSpecMatch(
+  ligneSpecs: ExtractedLigneSpecs,
+  candidate: CatalogueItem
+): SpecMatchBreakdown {
+  const matched: SpecMatchBreakdown["matched"] = [];
+  const disagreeing: SpecMatchBreakdown["disagreeing"] = [];
+  let score = 0;
+
+  const candidateSpecs = candidate.specs;
+  if (candidateSpecs) {
+    for (const [ligneKey, ligneValueRaw] of Object.entries(ligneSpecs.specs)) {
+      const matchedKey = specKeyAliases(ligneKey).find((ak) =>
+        Object.prototype.hasOwnProperty.call(candidateSpecs, ak)
+      );
+      if (!matchedKey) continue;
+
+      const outcome = compareSpecValues(ligneKey, ligneValueRaw, candidateSpecs[matchedKey]);
+      if (outcome === "neutral") continue; // unparseable numeric value on either side -- can't compare
+
+      if (outcome === "match") {
+        matched.push({ key: ligneKey, value: String(ligneValueRaw) });
+        score += 2;
+      } else {
+        disagreeing.push({
+          key: ligneKey,
+          ligneValue: String(ligneValueRaw),
+          candidateValue: String(candidateSpecs[matchedKey]),
+        });
+        score -= 1;
+      }
+    }
+  }
+
+  const candidateTokens = new Set(tokenize(`${candidate.designation} ${flattenSpecs(candidate.specs)}`));
+  const matchedMotsCles = ligneSpecs.mots_cles.filter((kw) => candidateTokens.has(kw));
+  score += matchedMotsCles.length * 0.5;
+
+  return { score, matched, disagreeing, matchedMotsCles };
+}
+
 function scoreCandidate(
   zoneTokens: Set<string>,
   designationTokens: Set<string>,
+  ligneSpecs: ExtractedLigneSpecs,
   indexed: IndexedCatalogueItem
 ): ScoredCandidate {
   const categoryScore = tokenSetRatioFromSets(zoneTokens, indexed.catTokens);
   const textScore = tokenSetRatioFromSets(designationTokens, indexed.catalogueTokens);
+  const specMatch = computeSpecMatchScore(ligneSpecs, indexed);
   return {
     catalogueItem: indexed.item,
     categoryScore,
     textScore,
+    specMatchScore: specMatch.score,
+    hasGenuineSpecMatch: specMatch.matchedCount > 0,
+    allSpecsConflict: specMatch.comparedCount > 0 && specMatch.matchedCount === 0,
     price: Number(indexed.item.prix_fourniture ?? 0),
   };
 }
 
-/** Category is now a hard pre-filter (see rankCandidates below), not a
- *  scoring dimension — once we're only looking at candidates that already
- *  passed the unit + category filters, ranking is purely
- *  description/specs similarity, then cheapest price. categoryScore is
- *  kept on ScoredCandidate for debugging/display, it just no longer
- *  drives sort order. */
-function compareCandidates(a: ScoredCandidate, b: ScoredCandidate): number {
+/** Category is a hard pre-filter (see rankCandidates below), not a scoring
+ *  dimension — categoryScore is kept on ScoredCandidate for
+ *  debugging/display only, it doesn't drive sort order.
+ *
+ *  specMatchScore (real spec-vs-spec agreement) is the primary signal: once
+ *  the pool has already passed the unit + category filters, matching
+ *  diamètre/pression/matériau/etc. is a much stronger "is this actually the
+ *  same product" signal than generic description text overlap. textScore is
+ *  now only a tiebreaker between candidates tied on specMatchScore, and
+ *  price remains the final tiebreaker.
+ *
+ *  Ahead of all of that: a hard tier split on spec conflict. A candidate
+ *  that actively disagrees on every comparable spec (allSpecsConflict)
+ *  must never outrank one with at least one genuine match
+ *  (hasGenuineSpecMatch) — not on specMatchScore (already guaranteed by
+ *  the +2/-1 formula in most cases), and not on the price/text tiebreakers
+ *  either, which the raw score alone can't guarantee once ties are
+ *  possible. A candidate that's merely silent on every spec (no
+ *  comparable data either way) sits in the middle: no evidence it's
+ *  wrong, so it isn't floored, but no evidence it's right either, so it
+ *  doesn't outrank a genuine match. */
+function specTier(c: ScoredCandidate): number {
+  if (c.hasGenuineSpecMatch) return 0;
+  if (c.allSpecsConflict) return 2;
+  return 1;
+}
+
+function compareCandidatesBySpecMatch(a: ScoredCandidate, b: ScoredCandidate): number {
+  const tierDiff = specTier(a) - specTier(b);
+  if (tierDiff !== 0) return tierDiff;
+  const specDiff = Math.round(b.specMatchScore * 100) - Math.round(a.specMatchScore * 100);
+  if (specDiff !== 0) return specDiff;
+  const textDiff = Math.round(b.textScore * 100) - Math.round(a.textScore * 100);
+  if (textDiff !== 0) return textDiff;
+  return a.price - b.price;
+}
+
+/** Original text-first ordering, kept as the fallback for any ligne whose
+ *  local extraction found no usable specs at all — with nothing to
+ *  compare, specMatchScore would be 0 for every candidate and provide no
+ *  signal, so text similarity is the best available ranking signal. */
+function compareCandidatesByText(a: ScoredCandidate, b: ScoredCandidate): number {
   const textDiff = Math.round(b.textScore * 100) - Math.round(a.textScore * 100);
   if (textDiff !== 0) return textDiff;
   return a.price - b.price;
@@ -297,17 +938,19 @@ export interface RankOptions {
    *  Keep this comfortably above topN so a merely-average text match
    *  doesn't get eliminated before the real scoring gets to see it. */
   prefilterKeep?: number;
-  /** Minimum token_set_ratio (0-100) between the ligne's chapitre_ou_zone
-   *  and a catalogue item's categorie/sous_categorie for that item to
-   *  survive the hard category filter. Default 45 — items below this are
-   *  excluded entirely, same as a unit mismatch. */
-  categoryFilterThreshold?: number;
-  /** Minimum number of real tokens chapitre_ou_zone must contain before
-   *  we trust it enough to hard-filter on it at all. A missing/very short
-   *  or generic zone label ("Divers", "Lot 3") can't be confidently
-   *  mapped to a catalogue categorie, so filtering on it would just
-   *  produce false negatives. Default 2. */
-  minCategoryTokensForFilter?: number;
+  /** Debug hook: called once per rankCandidates() call with the pool size
+   *  at each hard-filter stage (unit -> category -> prefilter), so callers
+   *  can inspect the "hidden process" without changing ranking behavior. */
+  onDebug?: (counts: {
+    catalogueSize: number;
+    afterUnitFilter: number;
+    afterCategoryFilter: number;
+    afterPrefilter: number;
+    /** Set when the ligne's extracted categorie was confidently known and
+     *  the hard category filter genuinely found zero catalogue items in
+     *  that categorie (as opposed to the filter simply not applying). */
+    categoryFilterExcludedAll: boolean;
+  }) => void;
 }
 
 export function rankCandidates(
@@ -316,11 +959,10 @@ export function rankCandidates(
   topN = 4,
   rankOptions: RankOptions = {}
 ): ScoredCandidate[] {
-  const {
+    const {
     prefilterThreshold = 150,
     prefilterKeep = 60,
-    categoryFilterThreshold = 45,
-    minCategoryTokensForFilter = 2,
+    onDebug,
   } = rankOptions;
   const targetUnit = normalizeUnit(ligne.unite);
 
@@ -333,32 +975,50 @@ export function rankCandidates(
   // candidate pool, instead of re-tokenizing per catalogue item — this is
   // the difference between O(pool) and O(pool) *string parsing* work per
   // ligne vs. per (ligne, candidate) pair.
-  //
-  // zoneOnlyTokens (chapitre_ou_zone alone) is the category *filter*
-  // signal — kept separate from designation so a strong designation match
-  // can't paper over a genuinely different zone/category.
-  const zoneOnlyTokens = new Set(tokenize(ligne.chapitre_ou_zone ?? ""));
   const zoneTokens = new Set(tokenize(`${ligne.chapitre_ou_zone ?? ""} ${ligne.designation}`));
   const designationTokens = new Set(tokenize(ligne.designation));
+
+  // Local (no-network) spec extraction, once per ligne — reused across
+  // every candidate below. Whether it found anything decides which
+  // comparator drives the final sort (see hasUsableSpecs below).
+  const ligneSpecs = extractLigneSpecsLocal(ligne);
+  const hasUsableSpecs = Object.keys(ligneSpecs.specs).length > 0;
 
   // HARD FILTER 2: category. Applied on top of the unit pool, before any
   // Levenshtein-based scoring runs — narrows the pool the same way the
   // unit filter does, rather than just down-ranking a category mismatch.
   //
-  // Only trust chapitre_ou_zone enough to filter on it when it carries
-  // enough real signal (minCategoryTokensForFilter tokens), and only keep
-  // the narrowed pool if it's actually non-empty. Either way an ambiguous
-  // or unmatchable category falls back to the unit-only pool plus
-  // description scoring below, instead of silently returning zero
-  // candidates.
+  // categorie is a small, known set (see CATEGORY_RULES), so this is a
+  // plain case-insensitive EXACT match between the ligne's extracted
+  // categorie (ligneSpecs.categorie, from inferCategorie) and the
+  // candidate's real materiel_catalogue `categorie` column — no fuzzy
+  // token overlap here, and nothing else stands in for it.
+  //
+  // ligneSpecs.categorie is only trusted to filter on when inferCategorie
+  // actually resolved one (a missing/unmatchable designation+zone leaves
+  // it null rather than guessing — see inferCategorie) — an unknown
+  // categorie can't be filtered on, so the unit-only pool is used as-is.
+  //
+  // Critically: when the categorie IS known and filtering it genuinely
+  // leaves zero matches (e.g. no ventilation products yet in the
+  // catalogue), that is NOT treated as "the filter must be wrong, ignore
+  // it" — fullPool becomes empty and stays empty. Falling back to the
+  // unfiltered pool here is exactly what let wrong-category candidates
+  // (e.g. Tuyauterie items) survive a Ventilation filter and get
+  // presented as if they were valid matches. An honest empty result is
+  // the correct outcome; the caller (processBatch/processMarcheLigne/
+  // localAutoSelect/selectWithHaiku) turns a genuinely empty pool into an
+  // explicit "no catalogue candidates in this categorie" decision instead
+  // of guessing.
   let fullPool = unitPool;
-  if (zoneOnlyTokens.size >= minCategoryTokensForFilter) {
+  let categoryFilterExcludedAll = false;
+  if (ligneSpecs.categorie) {
+    const targetCategorie = ligneSpecs.categorie.trim().toLowerCase();
     const categoryMatched = unitPool.filter(
-      (indexed) => tokenSetRatioFromSets(zoneOnlyTokens, indexed.catTokens) >= categoryFilterThreshold
+      (indexed) => (indexed.item.categorie ?? "").trim().toLowerCase() === targetCategorie
     );
-    if (categoryMatched.length > 0) {
-      fullPool = categoryMatched;
-    }
+    fullPool = categoryMatched;
+    categoryFilterExcludedAll = categoryMatched.length === 0;
   }
 
   // The expensive step is the Levenshtein-based token_set_ratio scoring
@@ -376,8 +1036,16 @@ export function rankCandidates(
         )
       : fullPool;
 
-  const scored = pool.map((indexed) => scoreCandidate(zoneTokens, designationTokens, indexed));
-  scored.sort(compareCandidates);
+    onDebug?.({
+    catalogueSize: index.size,
+    afterUnitFilter: unitPool.length,
+    afterCategoryFilter: fullPool.length,
+    afterPrefilter: pool.length,
+    categoryFilterExcludedAll,
+  });
+
+  const scored = pool.map((indexed) => scoreCandidate(zoneTokens, designationTokens, ligneSpecs, indexed));
+  scored.sort(hasUsableSpecs ? compareCandidatesBySpecMatch : compareCandidatesByText);
   return scored.slice(0, topN);
 }
 
@@ -395,11 +1063,11 @@ Réponds STRICTEMENT en JSON, rien d'autre, avec ce schéma :
 {"chosen_catalogue_id": "<id du candidat choisi>", "confidence": "high"|"medium"|"low", "justification": "<1-2 phrases en français>"}
 
 Si aucun candidat ne correspond raisonnablement au besoin, renvoie \
-{"chosen_catalogue_id": null, "confidence": "low", "justification": "<pourquoi aucun ne convient>"}.`;
+{"chosen_catalogue_id": null, "confidence": "none", "justification": "<pourquoi aucun ne convient>"}.`;
 
 const DecisionSchema = z.object({
   chosen_catalogue_id: z.string().nullable(),
-  confidence: z.enum(["high", "medium", "low"]),
+  confidence: z.enum(["high", "medium", "low", "none"]),
   justification: z.string(),
 });
 
@@ -442,9 +1110,131 @@ function parseDecision(raw: string): Decision {
 
 const FALLBACK_DECISION = (justification: string): Decision => ({
   chosen_catalogue_id: null,
-  confidence: "low",
+  confidence: "none",
   justification,
 });
+
+/** Decision for a ligne that reached selection with zero candidates.
+ *  Distinguishes "we know the categorie and the catalogue genuinely has
+ *  nothing in it" (actionable — catalogue is missing coverage) from the
+ *  generic "no candidates at all" case (unknown categorie, empty
+ *  catalogue, etc.), so the justification tells the user which one it is
+ *  instead of a single opaque message either way. */
+function noCandidatesDecision(ligne: MarcheLigne): Decision {
+  const { categorie } = extractLigneSpecsLocal(ligne);
+  return FALLBACK_DECISION(
+    categorie
+      ? `Aucun article de catégorie ${categorie} trouvé dans le catalogue.`
+      : "Aucun candidat disponible."
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 6b. Local (no-network) auto-selection — used by processBatch /
+//     processMarcheLigne INSTEAD of calling selectWithHaiku whenever no
+//     apiCallFn was injected and no Haiku API key is configured (e.g.
+//     while Haiku credits/access are unavailable). selectWithHaiku itself
+//     is untouched: once apiCallFn is available again (injected, or
+//     ANTHROPIC_API_KEY set), the exact same call sites go back to real
+//     Haiku selection with no further code changes.
+// ---------------------------------------------------------------------------
+
+/** Whether a real Haiku call can be attempted via the default client (i.e.
+ *  defaultAnthropicCall wouldn't immediately fail for lack of
+ *  credentials). Guarded for non-Node environments where `process` isn't
+ *  defined. */
+function isHaikuConfigured(): boolean {
+  try {
+    return typeof process !== "undefined" && !!process.env?.ANTHROPIC_API_KEY;
+  } catch {
+    return false;
+  }
+}
+
+/** Local specs (from extractLigneSpecsLocal) whose value equals — after
+ *  alias resolution + normalization, same rules as computeSpecMatchScore —
+ *  the top candidate's real spec value. Used only to render a human
+ *  justification string, not to score/rank (rankCandidates already did
+ *  that; this just explains its #1 pick in French). */
+function matchedSpecEntries(
+  ligneSpecs: ExtractedLigneSpecs,
+  top: ScoredCandidate
+): { key: string; value: string }[] {
+  const candidateSpecs = top.catalogueItem.specs;
+  const matches: { key: string; value: string }[] = [];
+  if (!candidateSpecs) return matches;
+
+  for (const [ligneKey, ligneValueRaw] of Object.entries(ligneSpecs.specs)) {
+    const matchedKey = specKeyAliases(ligneKey).find((ak) =>
+      Object.prototype.hasOwnProperty.call(candidateSpecs, ak)
+    );
+    if (!matchedKey) continue;
+    if (compareSpecValues(ligneKey, ligneValueRaw, candidateSpecs[matchedKey]) === "match") {
+      matches.push({ key: ligneKey, value: ligneValueRaw });
+    }
+  }
+  return matches;
+}
+
+/** Builds a French justification string describing WHY the #1 ranked
+ *  candidate was picked, e.g. "Correspondance specs: diamètre 20mm,
+ *  matériau laiton (2/2 critères), catégorie Tuyauterie — sélection
+ *  automatique (Haiku indisponible)." Falls back to describing the text
+ *  similarity signal when the ligne had no locally-extractable specs at
+ *  all (same case rankCandidates itself falls back to text ordering for). */
+function buildLocalJustification(ligneSpecs: ExtractedLigneSpecs, top: ScoredCandidate): string {
+  const totalSpecs = Object.keys(ligneSpecs.specs).length;
+  const categoriePart = top.catalogueItem.categorie ? `, catégorie ${top.catalogueItem.categorie}` : "";
+
+  if (totalSpecs > 0) {
+    const matches = matchedSpecEntries(ligneSpecs, top);
+    const specPart =
+      matches.length > 0
+        ? matches.map((m) => `${SPEC_LABELS[m.key] ?? m.key} ${m.value}`).join(", ")
+        : "aucune correspondance exacte";
+    return (
+      `Correspondance specs: ${specPart} (${matches.length}/${totalSpecs} critères)` +
+      `${categoriePart} — sélection automatique (Haiku indisponible).`
+    );
+  }
+
+  return (
+    `Meilleure correspondance texte parmi les candidats, score ${Math.round(top.textScore)}%` +
+    `${categoriePart} — sélection automatique (Haiku indisponible).`
+  );
+}
+
+/**
+ * No-network stand-in for selectWithHaiku: auto-selects the #1 ranked
+ * candidate (rankCandidates already did the real ranking work — spec-match
+ * first, text similarity as tiebreaker/fallback) and generates a
+ * justification from the actual matched spec keys instead of leaving it
+ * empty. Same Decision shape as selectWithHaiku's output, so callers and
+ * downstream code (recap UI, PDF/XLSX renderers, activity logs) don't need
+ * to know which path produced a given row's decision.
+ *
+ * Confidence is capped at "medium": this is a heuristic pick, not a
+ * verified one, even when every extracted spec matched exactly.
+ */
+export function localAutoSelect(ligne: MarcheLigne, candidates: ScoredCandidate[]): Decision {
+  if (candidates.length === 0) {
+    return noCandidatesDecision(ligne);
+  }
+
+  const top = candidates[0];
+  const ligneSpecs = extractLigneSpecsLocal(ligne);
+  const totalSpecs = Object.keys(ligneSpecs.specs).length;
+  const matchedCount = matchedSpecEntries(ligneSpecs, top).length;
+
+  const confidence: Decision["confidence"] =
+    totalSpecs > 0 && matchedCount === totalSpecs ? "medium" : "low";
+
+  return {
+    chosen_catalogue_id: top.catalogueItem.id,
+    confidence,
+    justification: buildLocalJustification(ligneSpecs, top),
+  };
+}
 
 export interface SelectOptions {
   /** Retries on transient failure (network error, malformed JSON). Default 2. */
@@ -466,7 +1256,7 @@ export async function selectWithHaiku(
   options: SelectOptions = {}
 ): Promise<Decision> {
   if (candidates.length === 0) {
-    return FALLBACK_DECISION("Aucun candidat disponible.");
+    return noCandidatesDecision(ligne);
   }
 
   const { retries = 2, retryBaseDelayMs = 300 } = options;
@@ -577,11 +1367,18 @@ export async function processBatch(
     topN = 4,
     concurrency = 8,
     select,
-    apiCallFn = defaultAnthropicCall,
+    apiCallFn,
     cache,
     onProgress,
     keyFor = (l) => l.numero ?? l.designation,
   } = options;
+
+  // No apiCallFn injected and no Haiku credentials configured (e.g. while
+  // Haiku access/credits are unavailable) -> skip the network call
+  // entirely and auto-select locally. Passing a real apiCallFn (or
+  // configuring ANTHROPIC_API_KEY again) reverts to real Haiku selection
+  // with no other changes needed here.
+  const useLocalFallback = !apiCallFn && !isHaikuConfigured();
 
   const index = new CatalogueIndex(catalogue);
   let done = 0;
@@ -596,7 +1393,9 @@ export async function processBatch(
     }
 
     const candidates = rankCandidates(ligne, index, topN);
-    const decision = await selectWithHaiku(ligne, candidates, apiCallFn, select);
+    const decision = useLocalFallback
+      ? localAutoSelect(ligne, candidates)
+      : await selectWithHaiku(ligne, candidates, apiCallFn ?? defaultAnthropicCall, select);
     const result: ProcessResult = {
       marche_ligne_numero: ligne.numero ?? null,
       candidates_considered: candidates.map((c) => c.catalogueItem.id),
@@ -654,7 +1453,7 @@ export async function processBatchViaMessageBatches(
       const result: ProcessResult = {
         marche_ligne_numero: ligne.numero ?? null,
         candidates_considered: [],
-        decision: FALLBACK_DECISION("Aucun candidat disponible."),
+        decision: noCandidatesDecision(ligne),
       };
       results.set(key, result);
       if (cache) await cache.set(key, result);
@@ -748,12 +1547,18 @@ async function waitForBatchCompletion(
 export async function processMarcheLigne(
   ligne: MarcheLigne,
   catalogueOrIndex: CatalogueItem[] | CatalogueIndex,
-  apiCallFn: ApiCallFn = defaultAnthropicCall,
+  apiCallFn?: ApiCallFn,
   topN = 4
 ): Promise<ProcessResult> {
   const index = catalogueOrIndex instanceof CatalogueIndex ? catalogueOrIndex : new CatalogueIndex(catalogueOrIndex);
   const candidates = rankCandidates(ligne, index, topN);
-  const decision = await selectWithHaiku(ligne, candidates, apiCallFn);
+  // Same local-fallback rule as processBatch: no injected apiCallFn and no
+  // Haiku credentials configured -> auto-select locally instead of a
+  // network call. Pass a real apiCallFn later to go back to Haiku.
+  const decision =
+    !apiCallFn && !isHaikuConfigured()
+      ? localAutoSelect(ligne, candidates)
+      : await selectWithHaiku(ligne, candidates, apiCallFn ?? defaultAnthropicCall);
   return {
     marche_ligne_numero: ligne.numero ?? null,
     candidates_considered: candidates.map((c) => c.catalogueItem.id),

@@ -16,6 +16,7 @@ import {
 
 import { supabase } from "@/integrations/supabase/client";
 import type { Tables, TablesInsert } from "@/integrations/supabase/types";
+import { traceMarcheLigne } from "@/lib/parsing/Debugtrace";
 import {
   processBatch,
   rankCandidates,
@@ -295,16 +296,16 @@ const rankLigneCandidatesServerFn = createServerFn({ method: "POST" })
     }));
 
     const index = new CatalogueIndex(catalogueForRanking);
-    const scored = rankCandidates(
-      {
-        designation: ligne.designation,
-        unite: ligne.unite,
-        quantite: ligne.quantite,
-        chapitre_ou_zone: ligne.chapitre_ou_zone,
-      },
-      index,
-      4,
-    );
+    const rankedLigne = {
+      designation: ligne.designation,
+      unite: ligne.unite,
+      quantite: ligne.quantite,
+      chapitre_ou_zone: ligne.chapitre_ou_zone,
+    };
+    const scored = rankCandidates(rankedLigne, index, 4);
+    if (process.env["DEBUG_RANKER"] === "1") {
+      traceMarcheLigne(rankedLigne, index, 4);
+    }
 
     const candidates: RankedCandidate[] = scored
       .map((c) => {
